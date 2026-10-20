@@ -456,7 +456,42 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 		} else {
 			findOK = true
 			room, ok := resolveRoom(targets, avail)
-			if !ok {
+			if !ok && rule.AllowNoRoom {
+				ev, err := e.lark.CreateEvent(ctx, rule.Name, "由 lark-schedule-meeting 自动预约", start, end, nil)
+				if err != nil {
+					lastErr = err.Error()
+					e.store.AppendAttempt(model.Attempt{
+						RuleID: rule.ID, RuleName: rule.Name, Date: date,
+						Kind: "create", OK: false,
+						Detail: fmt.Sprintf("第 %d 次无会议室预约失败：%v", attempt, err),
+					})
+					e.updateSession(key, func(ss *Session) {
+						ss.AttemptsDone = attempt
+						ss.LastMessage = "无会议室预约失败：" + lastErr
+					})
+				} else {
+					booked = true
+					note := fmt.Sprintf("第 %d 次尝试成功：目标会议室不可用，已按无会议室预约（allowNoRoom）", attempt)
+					_ = e.store.UpsertRecord(model.Record{
+						RuleID: rule.ID, RuleName: rule.Name, Date: date,
+						Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339),
+						Status: model.StatusBooked, Source: source,
+						EventID: ev.ID, CalendarID: ev.CalendarID,
+						Note: note, Attempts: attempt,
+					})
+					e.store.AppendAttempt(model.Attempt{
+						RuleID: rule.ID, RuleName: rule.Name, Date: date,
+						Kind: "create", OK: true, Detail: note,
+					})
+					e.updateSession(key, func(ss *Session) {
+						ss.AttemptsDone = attempt
+						ss.Status = SessionBooked
+						ss.LastMessage = note
+					})
+					log.Info(note, "event_id", ev.ID)
+					return
+				}
+			} else if !ok {
 				busy := make([]string, 0, len(targets))
 				for _, t := range targets {
 					busy = append(busy, t.Name)

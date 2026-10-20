@@ -28,6 +28,9 @@ type Rule struct {
 	EndTime     string               `json:"endTime"`     // 会议结束 HH:MM
 	TriggerTime string               `json:"triggerTime"` // 抢会议室触发时刻 HH:MM
 	Enabled     bool                 `json:"enabled"`
+	// AllowNoRoom 为 true 时，目标会议室全部不可用也照常创建日程（不带会议室）。
+	// 用于无可视会议室环境（如公司内网之外）验证预约链路，或允许无房会议。
+	AllowNoRoom bool `json:"allowNoRoom,omitempty"`
 	// WindowMinutes 覆盖全局抢座窗口（分钟）；0 表示使用全局配置。
 	WindowMinutes int `json:"windowMinutes,omitempty"`
 	// IntervalSeconds 覆盖全局尝试间隔（秒）；0 表示使用全局配置。
