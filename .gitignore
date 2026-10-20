@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# build outputs
+web/dist/
+dist/
+server/bin/
+
+# runtime data (rules, booking records, logs)
+data/
+
+# logs
+*.log
+
+# editors
+.vscode/
+.idea/
+.DS_Store
+
+# env
+.env
+.env.*

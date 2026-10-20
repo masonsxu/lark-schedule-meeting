@@ -1,0 +1,11 @@
+{
+  "name": "lark-schedule-meeting",
+  "private": true,
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "build:web": "pnpm --filter web build",
+    "dev:server": "go run ./server/cmd/lsm",
+    "test:server": "go test ./server/...",
+    "build:server": "go build -o server/bin/lsm ./server/cmd/lsm"
+  }
+}
