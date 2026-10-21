@@ -9,8 +9,12 @@ export interface Rule {
   id: string
   name: string
   description?: string
-  /** 键 "1"=周一 ... "7"=周日，值为按优先级排序的会议室列表 */
-  weekdays: Record<string, RoomRef[]>
+  /** 首次目标会议日期 YYYY-MM-DD */
+  startDate: string
+  /** 循环规则：once | daily | weekly | monthly | quarterly；空为 once */
+  cycle: string
+  /** 会议室优先级列表（固定 ID 直传） */
+  rooms: RoomRef[]
   startTime: string
   endTime: string
   triggerTime: string
@@ -88,6 +92,18 @@ export interface AppConfig {
   grabWindowMinutes: number
   grabIntervalSeconds: number
   attemptLogCap: number
+}
+
+export const CYCLE_OPTIONS = [
+  { value: 'once', label: '不循环（只抢一次）' },
+  { value: 'daily', label: '每天' },
+  { value: 'weekly', label: '每周' },
+  { value: 'monthly', label: '每月' },
+  { value: 'quarterly', label: '每季度' },
+] as const
+
+export function cycleLabel(cycle?: string): string {
+  return CYCLE_OPTIONS.find((o) => o.value === (cycle || 'once'))?.label ?? cycle ?? ''
 }
 
 export const WEEKDAY_KEYS = ['1', '2', '3', '4', '5', '6', '7'] as const

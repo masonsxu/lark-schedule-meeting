@@ -2,7 +2,8 @@
 import { computed, ref } from 'vue'
 import { api } from '../api'
 import type { BookingRecord, Rule } from '../types'
-import { WEEKDAY_KEYS, WEEKDAY_NAMES } from '../types'
+import { cycleLabel } from '../types'
+import { nextGrab } from '../cycle'
 
 const props = defineProps<{ rule: Rule; records: BookingRecord[] }>()
 const emit = defineEmits<{ edit: [rule: Rule]; changed: [] }>()
@@ -10,33 +11,13 @@ const emit = defineEmits<{ edit: [rule: Rule]; changed: [] }>()
 const busy = ref(false)
 const error = ref('')
 
-const activeWeekdays = computed(() =>
-  WEEKDAY_KEYS.filter((k) => (props.rule.weekdays[k] ?? []).length > 0),
-)
-
 const latestRecord = computed(() =>
   [...props.records].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0],
 )
 
-/** 下一次抢座计划：抢座日 + 时刻 -> 目标会议日期。 */
-function nextGrab(rule: Rule): { grabDate: string; targetDate: string } | null {
-  const keys: string[] = WEEKDAY_KEYS.filter((k) => (rule.weekdays[k] ?? []).length > 0)
-  if (keys.length === 0) return null
-  const lead = rule.leadDays && rule.leadDays > 0 ? rule.leadDays : 30
-  const skipWE = rule.skipWeekends !== false
-  const fmt = (d: Date) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-  const now = new Date()
-  for (let i = 0; i < 75; i++) {
-    const gd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i)
-    const td = new Date(gd.getFullYear(), gd.getMonth(), gd.getDate() + lead)
-    const iso = String(td.getDay() === 0 ? 7 : td.getDay())
-    if (!keys.includes(iso)) continue
-    if (skipWE && (iso === '6' || iso === '7')) continue
-    return { grabDate: fmt(gd), targetDate: fmt(td) }
-  }
-  return null
-}
+const plan = computed(() => nextGrab(props.rule))
+
+const roomsTitle = computed(() => props.rule.rooms.map((r) => r.name || r.id).join(' → '))
 
 async function toggleEnabled() {
   busy.value = true
@@ -55,8 +36,7 @@ async function runNow() {
   busy.value = true
   error.value = ''
   try {
-    const plan = nextGrab(props.rule)
-    await api.runRule(props.rule.id, { date: plan?.targetDate })
+    await api.runRule(props.rule.id, { date: plan.value?.targetDate })
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -96,26 +76,26 @@ async function remove() {
         <dd class="mono">{{ rule.startTime }} – {{ rule.endTime }}</dd>
       </div>
       <div class="meta-row">
+        <dt>循环</dt>
+        <dd>{{ cycleLabel(rule.cycle) }}<span class="meta-sub">，首次 {{ rule.startDate }}</span></dd>
+      </div>
+      <div class="meta-row">
         <dt>抢座开始</dt>
         <dd class="mono">{{ rule.triggerTime }}（提前 {{ rule.leadDays && rule.leadDays > 0 ? rule.leadDays : 30 }} 天）</dd>
       </div>
-      <div v-if="nextGrab(rule)" class="meta-row">
+      <div v-if="plan" class="meta-row">
         <dt>下次抢座</dt>
-        <dd class="mono">{{ nextGrab(rule)!.grabDate }} {{ rule.triggerTime }} → 目标 {{ nextGrab(rule)!.targetDate }}</dd>
+        <dd class="mono">{{ plan.grabDate }} {{ rule.triggerTime }} → 目标 {{ plan.targetDate }}</dd>
+      </div>
+      <div class="meta-row">
+        <dt>会议室</dt>
+        <dd class="rooms-line" :title="roomsTitle">
+          <span v-for="(room, i) in rule.rooms" :key="room.id" class="room-chip">
+            <span class="room-priority mono">{{ i + 1 }}</span>{{ room.name || room.id }}
+          </span>
+        </dd>
       </div>
     </dl>
-
-    <div class="weekday-chips">
-      <span
-        v-for="k in WEEKDAY_KEYS"
-        :key="k"
-        class="chip"
-        :class="{ on: activeWeekdays.includes(k) }"
-        :title="activeWeekdays.includes(k) ? rule.weekdays[k].map((r) => r.name || r.id).join(' → ') : ''"
-      >
-        {{ WEEKDAY_NAMES[k] }}
-      </span>
-    </div>
 
     <p v-if="latestRecord" class="latest">
       <span class="badge" :class="'badge-' + latestRecord.status">
@@ -128,7 +108,13 @@ async function remove() {
     <p v-if="error" class="card-error" role="alert">{{ error }}</p>
 
     <div class="card-actions">
-      <button class="btn btn-sm" type="button" :disabled="busy" @click="runNow" :title="`立即抢目标日期 ${nextGrab(rule)?.targetDate ?? ''}`">
+      <button
+        class="btn btn-sm"
+        type="button"
+        :disabled="busy"
+        @click="runNow"
+        :title="`立即抢目标日期 ${plan?.targetDate ?? ''}`"
+      >
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
         </svg>
@@ -192,27 +178,44 @@ async function remove() {
 
 .meta-row dd {
   margin: 0;
+  min-width: 0;
 }
 
-.weekday-chips {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.chip {
-  padding: 2px 9px;
-  border-radius: 999px;
-  font-size: 12.5px;
+.meta-sub {
   color: var(--text-muted);
-  border: 1px solid var(--border);
-  background: var(--surface-2);
 }
 
-.chip.on {
-  color: var(--accent);
-  border-color: rgba(76, 125, 255, 0.45);
+.rooms-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.room-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px 1px 2px;
+  border-radius: var(--radius-sm);
   background: var(--accent-soft);
+  border: 1px solid rgba(76, 125, 255, 0.4);
+  font-size: 12px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-priority {
+  width: 15px;
+  height: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent-strong);
+  color: #fff;
+  font-size: 10px;
 }
 
 .latest {
@@ -246,7 +249,6 @@ async function remove() {
   gap: 8px;
 }
 
-/* 开关 */
 .switch {
   position: relative;
   display: inline-flex;

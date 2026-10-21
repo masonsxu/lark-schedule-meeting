@@ -23,17 +23,41 @@ func (r RoomRef) DisplayName() string {
 	return r.ID
 }
 
+// 循环规则类型（一次只能选择一种；空值视为 CycleOnce）。
+const (
+	// CycleOnce 不循环：只抢首个目标日期一次，抢完（无论成败）规则自动关闭。
+	CycleOnce = "once"
+	// CycleDaily 按天循环。
+	CycleDaily = "daily"
+	// CycleWeekly 按周循环（同星期）。
+	CycleWeekly = "weekly"
+	// CycleMonthly 按月循环（同日，月末日自动归一化）。
+	CycleMonthly = "monthly"
+	// CycleQuarterly 按季度循环（每 3 个月同日）。
+	CycleQuarterly = "quarterly"
+)
+
+// CycleNames 循环类型的展示名。
+var CycleNames = map[string]string{
+	CycleOnce: "不循环（只抢一次）", CycleDaily: "每天", CycleWeekly: "每周",
+	CycleMonthly: "每月", CycleQuarterly: "每季度",
+}
+
 // Rule 一条循环预约规则。
-// Weekdays 键为目标会议日期的星期（"1"=周一 ... "7"=周日），值为该日按优先级排序的会议室列表。
 type Rule struct {
-	ID          string               `json:"id"`
-	Name        string               `json:"name"`
-	Description string               `json:"description,omitempty"`
-	Weekdays    map[string][]RoomRef `json:"weekdays"`
-	StartTime   string               `json:"startTime"`   // 会议开始 HH:MM（目标日期当天）
-	EndTime     string               `json:"endTime"`     // 会议结束 HH:MM
-	TriggerTime string               `json:"triggerTime"` // 抢座开始时刻 HH:MM（在抢座日 = 目标日期 - LeadDays 当天生效）
-	// LeadDays 提前多少天的"抢座日"开始抢目标日期的会议室；<=0 视为默认 30
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// StartDate 首次目标会议日期（YYYY-MM-DD，本地时区）。
+	StartDate string `json:"startDate"`
+	// Cycle 循环规则：once | daily | weekly | monthly | quarterly；空为 once。
+	Cycle string `json:"cycle"`
+	// Rooms 会议室优先级列表（固定 ID 直传，依次尝试，第一个成功即结束）。
+	Rooms       []RoomRef `json:"rooms"`
+	StartTime   string    `json:"startTime"`   // 会议开始 HH:MM（目标日期当天）
+	EndTime     string    `json:"endTime"`     // 会议结束 HH:MM
+	TriggerTime string    `json:"triggerTime"` // 抢座开始时刻 HH:MM（在抢座日 = 目标日期 - LeadDays 当天生效）
+	// LeadDays 提前多少天的"抢座日"开始抢目标日期；<=0 视为默认 30
 	// （公司规则：会议室最早可提前 30 天预约，窗口开放即抢）。
 	LeadDays int `json:"leadDays,omitempty"`
 	// SkipWeekends 目标日期落在周六/周日时不抢；nil 视为 true（默认跳过周六日）。
@@ -47,6 +71,14 @@ type Rule struct {
 	IntervalSeconds int       `json:"intervalSeconds,omitempty"`
 	CreatedAt       time.Time `json:"createdAt"`
 	UpdatedAt       time.Time `json:"updatedAt"`
+}
+
+// CycleOrDefault 返回生效的循环类型。
+func (r *Rule) CycleOrDefault() string {
+	if r.Cycle == "" {
+		return CycleOnce
+	}
+	return r.Cycle
 }
 
 // LeadDaysOr 返回生效的提前天数。
@@ -143,22 +175,20 @@ func (r *Rule) Validate() error {
 	if r.Name == "" {
 		return errors.New("会议主题不能为空")
 	}
-	if len(r.Weekdays) == 0 {
-		return errors.New("至少需要配置一个触发星期")
+	if _, err := time.ParseInLocation("2006-01-02", r.StartDate, time.Local); err != nil {
+		return fmt.Errorf("首次目标日期应为 YYYY-MM-DD，得到 %q", r.StartDate)
 	}
-	for k, rooms := range r.Weekdays {
-		switch k {
-		case "1", "2", "3", "4", "5", "6", "7":
-		default:
-			return fmt.Errorf("非法星期键 %q", k)
-		}
-		if len(rooms) == 0 {
-			return fmt.Errorf("星期 %s 的会议室列表为空", k)
-		}
-		for _, room := range rooms {
-			if strings.TrimSpace(room.ID) == "" {
-				return fmt.Errorf("星期 %s 的会议室 %q 缺少固定 ID（omm_ 开头）", k, room.DisplayName())
-			}
+	switch r.Cycle {
+	case "", CycleOnce, CycleDaily, CycleWeekly, CycleMonthly, CycleQuarterly:
+	default:
+		return fmt.Errorf("循环规则应为 once/daily/weekly/monthly/quarterly，得到 %q", r.Cycle)
+	}
+	if len(r.Rooms) == 0 {
+		return errors.New("至少需要配置一间会议室（固定 ID）")
+	}
+	for i, room := range r.Rooms {
+		if strings.TrimSpace(room.ID) == "" {
+			return fmt.Errorf("第 %d 间会议室 %q 缺少固定 ID（omm_ 开头）", i+1, room.DisplayName())
 		}
 	}
 	sh, sm, err := ParseHM(r.StartTime)
@@ -185,6 +215,73 @@ func (r *Rule) Validate() error {
 		return errors.New("尝试间隔不能为负")
 	}
 	return nil
+}
+
+// startDay 解析首次目标日期（返回零值与错误）。
+func (r *Rule) startDay(loc *time.Location) (time.Time, error) {
+	return time.ParseInLocation("2006-01-02", r.StartDate, loc)
+}
+
+// occursOnBase 判断 date 是否为一次目标日期（不考虑周末跳过；date 为本地零点）。
+func (r *Rule) occursOnBase(date time.Time) bool {
+	start, err := r.startDay(date.Location())
+	if err != nil || date.Before(start) {
+		return false
+	}
+	switch r.CycleOrDefault() {
+	case CycleOnce:
+		return date.Equal(start)
+	case CycleDaily:
+		return true // start 起每天
+	case CycleWeekly:
+		for d := start; !d.After(date); d = d.AddDate(0, 0, 7) {
+			if d.Equal(date) {
+				return true
+			}
+		}
+		return false
+	case CycleMonthly, CycleQuarterly:
+		step := 1
+		if r.CycleOrDefault() == CycleQuarterly {
+			step = 3
+		}
+		for m := 0; ; m += step {
+			d := start.AddDate(0, m, 0)
+			if d.After(date) {
+				return false
+			}
+			if d.Equal(date) {
+				return true
+			}
+		}
+	default:
+		return false
+	}
+}
+
+// OccursOn 判断 date 是否为一次有效的目标日期（含周末跳过）。
+func (r *Rule) OccursOn(date time.Time) bool {
+	if !r.occursOnBase(date) {
+		return false
+	}
+	if r.SkipWeekendsOn() {
+		if wd := WeekdayKey(date); wd == "6" || wd == "7" {
+			return false
+		}
+	}
+	return true
+}
+
+// NextOccurrence 返回 from 起（含当天）第一个有效目标日期；maxDays 为搜索天数上限。
+func (r *Rule) NextOccurrence(from time.Time, maxDays int) (time.Time, bool) {
+	d := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, from.Location())
+	for i := 0; i < maxDays; i++ {
+		if r.OccursOn(d) {
+			return d, true
+		}
+		d = d.AddDate(0, 0, 1)
+	}
+	return time.Time{}, false
 }
 
 // SlotFor 计算规则在指定目标日期（2006-01-02）的会议起止时间。

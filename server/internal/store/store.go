@@ -54,7 +54,10 @@ func (s *Store) migrate() error {
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			description TEXT NOT NULL DEFAULT '',
-			weekdays TEXT NOT NULL,
+			weekdays TEXT NOT NULL DEFAULT '{}',
+			start_date TEXT NOT NULL DEFAULT '',
+			cycle TEXT NOT NULL DEFAULT '',
+			rooms TEXT NOT NULL DEFAULT '[]',
 			start_time TEXT NOT NULL,
 			end_time TEXT NOT NULL,
 			trigger_time TEXT NOT NULL,
@@ -110,7 +113,105 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("初始化表结构失败: %w", err)
 		}
 	}
+	return s.migrateRuleColumns()
+}
+
+// migrateRuleColumns 旧版 rules 表补齐 start_date/cycle/rooms 列，
+// 并把按星期配置（weekdays）的旧规则回填为 weekly 循环 + 首个星期的会议室列表。
+func (s *Store) migrateRuleColumns() error {
+	rows, err := s.db.Query(`PRAGMA table_info(rules)`)
+	if err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	for _, col := range []string{"start_date", "cycle", "rooms"} {
+		if !existing[col] {
+			if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE rules ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, col)); err != nil {
+				return fmt.Errorf("补列 %s 失败: %w", col, err)
+			}
+		}
+	}
+
+	// 回填旧 weekdays 规则。
+	legacy, err := s.db.Query(`SELECT id, weekdays, skip_weekends FROM rules WHERE rooms IN ('', '[]') AND weekdays NOT IN ('', '{}')`)
+	if err != nil {
+		return err
+	}
+	type legacyRule struct {
+		id           string
+		weekdays     string
+		skipWeekends sql.NullInt64
+	}
+	var toFix []legacyRule
+	for legacy.Next() {
+		var lr legacyRule
+		if err := legacy.Scan(&lr.id, &lr.weekdays, &lr.skipWeekends); err == nil {
+			toFix = append(toFix, lr)
+		}
+	}
+	legacy.Close()
+
+	now := time.Now()
+	for _, lr := range toFix {
+		var weekdays map[string][]model.RoomRef
+		if err := json.Unmarshal([]byte(lr.weekdays), &weekdays); err != nil || len(weekdays) == 0 {
+			continue
+		}
+		startDate, rooms := legacyWeekdayConvert(weekdays, now)
+		if startDate == "" {
+			continue
+		}
+		roomsJSON, _ := json.Marshal(rooms)
+		_, _ = s.db.Exec(`UPDATE rules SET start_date = ?, cycle = 'weekly', rooms = ? WHERE id = ?`,
+			startDate, string(roomsJSON), lr.id)
+	}
 	return nil
+}
+
+// legacyWeekdayConvert 旧版按星期配置转换为 weekly 循环：
+// 取编号最小星期的房间列表，首次目标日期为今天起下一个该星期。
+func legacyWeekdayConvert(weekdays map[string][]model.RoomRef, now time.Time) (string, []model.RoomRef) {
+	if len(weekdays) == 0 {
+		return "", nil
+	}
+	minKey := ""
+	for k := range weekdays {
+		if minKey == "" || k < minKey {
+			minKey = k
+		}
+	}
+	rooms := weekdays[minKey]
+	if len(rooms) == 0 {
+		return "", nil
+	}
+	wd := 1
+	if _, err := fmt.Sscanf(minKey, "%d", &wd); err != nil {
+		return "", nil
+	}
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	for i := 0; i < 8; i++ {
+		d := int(start.Weekday())
+		if d == 0 {
+			d = 7
+		}
+		if d == wd {
+			break
+		}
+		start = start.AddDate(0, 0, 1)
+	}
+	return start.Format("2006-01-02"), rooms
 }
 
 // migrateJSON 一次性导入旧版 JSON 数据文件（导入后重命名为 *.migrated）。
@@ -120,13 +221,28 @@ func (s *Store) migrateJSON() error {
 		run  func() error
 	}{
 		{"rules.json", func() error {
-			var rules map[string]model.Rule
+			// 旧版规则带 weekdays 字段，导入时转换为 weekly 循环 + 首个星期的房间列表。
+			var rules map[string]json.RawMessage
 			if err := readJSON(s.cfg.DataDir, "rules.json", &rules); err != nil || len(rules) == 0 {
 				return err
 			}
-			for _, r := range rules {
-				cp := r
-				if err := s.UpsertRule(cp); err != nil {
+			for _, raw := range rules {
+				var r model.Rule
+				if err := json.Unmarshal(raw, &r); err != nil {
+					continue
+				}
+				var legacy struct {
+					Weekdays map[string][]model.RoomRef `json:"weekdays"`
+				}
+				if err := json.Unmarshal(raw, &legacy); err == nil && len(legacy.Weekdays) > 0 && len(r.Rooms) == 0 {
+					startDate, rooms := legacyWeekdayConvert(legacy.Weekdays, time.Now())
+					if startDate != "" {
+						r.StartDate = startDate
+						r.Cycle = model.CycleWeekly
+						r.Rooms = rooms
+					}
+				}
+				if err := s.UpsertRule(r); err != nil {
 					return err
 				}
 			}
@@ -209,20 +325,21 @@ func (s *Store) SetConfig(cfg config.Config) error {
 
 // ---- 规则 ----
 
-const ruleCols = `id, name, description, weekdays, start_time, end_time, trigger_time,
+const ruleCols = `id, name, description, start_date, cycle, rooms, start_time, end_time, trigger_time,
 	lead_days, skip_weekends, enabled, allow_no_room, window_minutes, interval_seconds, created_at, updated_at`
 
 func scanRule(scan func(dest ...any) error) (model.Rule, error) {
 	var r model.Rule
-	var weekdays string
+	var rooms string
 	var skipWeekends sql.NullInt64
 	var createdAt, updatedAt string
-	if err := scan(&r.ID, &r.Name, &r.Description, &weekdays, &r.StartTime, &r.EndTime, &r.TriggerTime,
+	if err := scan(&r.ID, &r.Name, &r.Description, &r.StartDate, &r.Cycle, &rooms,
+		&r.StartTime, &r.EndTime, &r.TriggerTime,
 		&r.LeadDays, &skipWeekends, &r.Enabled, &r.AllowNoRoom, &r.WindowMinutes, &r.IntervalSeconds,
 		&createdAt, &updatedAt); err != nil {
 		return r, err
 	}
-	_ = json.Unmarshal([]byte(weekdays), &r.Weekdays)
+	_ = json.Unmarshal([]byte(rooms), &r.Rooms)
 	if skipWeekends.Valid {
 		v := skipWeekends.Int64 == 1
 		r.SkipWeekends = &v
@@ -277,7 +394,7 @@ func (s *Store) UpsertRule(r model.Rule) error {
 	} else {
 		r.CreatedAt = now
 	}
-	weekdays, err := json.Marshal(r.Weekdays)
+	rooms, err := json.Marshal(r.Rooms)
 	if err != nil {
 		return err
 	}
@@ -285,17 +402,20 @@ func (s *Store) UpsertRule(r model.Rule) error {
 	if r.SkipWeekends != nil {
 		skipWeekends = boolToInt(*r.SkipWeekends)
 	}
+	// weekdays 列在旧库带 NOT NULL 约束，新模型已不使用，恒写 '{}'。
 	_, err = s.db.Exec(`INSERT INTO rules
-		(id, name, description, weekdays, start_time, end_time, trigger_time, lead_days, skip_weekends,
+		(id, name, description, weekdays, start_date, cycle, rooms, start_time, end_time, trigger_time, lead_days, skip_weekends,
 		 enabled, allow_no_room, window_minutes, interval_seconds, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
-			name=excluded.name, description=excluded.description, weekdays=excluded.weekdays,
+			name=excluded.name, description=excluded.description,
+			start_date=excluded.start_date, cycle=excluded.cycle, rooms=excluded.rooms,
 			start_time=excluded.start_time, end_time=excluded.end_time, trigger_time=excluded.trigger_time,
 			lead_days=excluded.lead_days, skip_weekends=excluded.skip_weekends, enabled=excluded.enabled,
 			allow_no_room=excluded.allow_no_room, window_minutes=excluded.window_minutes,
 			interval_seconds=excluded.interval_seconds, updated_at=excluded.updated_at`,
-		r.ID, r.Name, r.Description, string(weekdays), r.StartTime, r.EndTime, r.TriggerTime,
+		r.ID, r.Name, r.Description, "{}", r.StartDate, r.CycleOrDefault(), string(rooms),
+		r.StartTime, r.EndTime, r.TriggerTime,
 		r.LeadDaysOr(), skipWeekends, r.Enabled, r.AllowNoRoom, r.WindowMinutes, r.IntervalSeconds,
 		fmtTime(r.CreatedAt), fmtTime(r.UpdatedAt))
 	return err

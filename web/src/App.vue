@@ -85,7 +85,7 @@ function onEditorSaved() {
     <header class="app-header">
       <div class="brand">
         <h1>会议室抢座台</h1>
-        <p class="tagline">飞书日历循环预约，提前 30 天定时抢，10 分钟窗口每分钟一次</p>
+        <p class="tagline">飞书会议室抢座：循环规则 + 提前 30 天定时，10 分钟窗口每分钟一次</p>
       </div>
       <div class="header-status">
         <span v-if="health?.lark.ok" class="badge badge-booked" title="lark-cli 授权正常">
@@ -115,7 +115,7 @@ function onEditorSaved() {
       </div>
       <div v-if="rules.length === 0" class="empty panel">
         <p>还没有循环预约规则。</p>
-        <p class="empty-hint">新建一条规则，配置会议主题、起止时间、触发时刻，再为每个星期挑选目标会议室（按优先级排序）。</p>
+        <p class="empty-hint">新建一条规则：会议主题、首次目标日期、循环规则（不循环/每天/每周/每月/每季度）、会议时间与会议室优先级。</p>
         <button class="btn btn-primary" type="button" @click="openCreate">创建第一条规则</button>
       </div>
       <div v-else class="rules-grid">

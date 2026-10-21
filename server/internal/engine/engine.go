@@ -171,17 +171,8 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// targetDateFor 返回规则在抢座日 grabDay 对应的目标会议日期（grabDay + LeadDays）。
-func (e *Engine) targetDateFor(rule *model.Rule, grabDay string, loc *time.Location) (time.Time, error) {
-	day, err := time.ParseInLocation("2006-01-02", grabDay, loc)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return day.AddDate(0, 0, rule.LeadDaysOr()), nil
-}
-
 // Scan 执行一次扫描：今天是否为某规则目标日期的抢座日（目标日期 = 今天 + LeadDays），
-// 是且到达 TriggerTime、无终态记录、无运行会话时启动会话。
+// 是且该日期为有效循环目标、到达 TriggerTime、无终态记录、无运行会话时启动会话。
 func (e *Engine) Scan() {
 	loc := e.location()
 	now := e.now().In(loc)
@@ -191,18 +182,12 @@ func (e *Engine) Scan() {
 		if !rule.Enabled {
 			continue
 		}
-		target, err := e.targetDateFor(&rule, today, loc)
-		if err != nil {
-			continue
+		targetDay := now.AddDate(0, 0, rule.LeadDaysOr())
+		target := time.Date(targetDay.Year(), targetDay.Month(), targetDay.Day(), 0, 0, 0, 0, loc)
+		if !rule.OccursOn(target) {
+			continue // 今天对应的不是有效目标日期（不匹配循环规则或落在周末）
 		}
 		date := target.Format("2006-01-02")
-		wd := model.WeekdayKey(target)
-		if len(rule.Weekdays[wd]) == 0 {
-			continue // 目标日期不是配置的星期
-		}
-		if rule.SkipWeekendsOn() && (wd == "6" || wd == "7") {
-			continue // 默认跳过周六日
-		}
 		trigger, err := rule.TriggerAt(today, loc)
 		if err != nil {
 			continue
@@ -251,9 +236,11 @@ func (e *Engine) Start(ruleID string, opts RunOptions) error {
 	loc := e.location()
 	date := opts.Date
 	if date == "" {
-		target, err := e.targetDateFor(&rule, e.now().In(loc).Format("2006-01-02"), loc)
-		if err != nil {
-			return err
+		// 默认抢下一个可抢的目标日期（抢座日不早于今天）。
+		from := e.now().In(loc).AddDate(0, 0, rule.LeadDaysOr())
+		target, ok := rule.NextOccurrence(from, 400)
+		if !ok {
+			return fmt.Errorf("规则 %s 在未来 %d 天内没有可抢的目标日期", rule.Name, 400)
 		}
 		date = target.Format("2006-01-02")
 	}
@@ -261,11 +248,7 @@ func (e *Engine) Start(ruleID string, opts RunOptions) error {
 	if err != nil {
 		return fmt.Errorf("日期格式应为 YYYY-MM-DD，得到 %q", date)
 	}
-	wd := model.WeekdayKey(day)
-	if len(rule.Weekdays[wd]) == 0 {
-		return fmt.Errorf("目标日期 %s 是星期 %s，规则未配置该星期", date, model.WeekdayName(wd))
-	}
-	if rule.SkipWeekendsOn() && (wd == "6" || wd == "7") {
+	if wd := model.WeekdayKey(day); rule.SkipWeekendsOn() && (wd == "6" || wd == "7") {
 		return fmt.Errorf("目标日期 %s 是周末，规则已启用跳过周六日", date)
 	}
 	start, end, err := rule.SlotFor(date, loc)
@@ -375,6 +358,28 @@ func overlap(ev lark.Event, start, end time.Time) bool {
 	return ev.Start.Before(end) && ev.End.After(start)
 }
 
+// closeIfOnce 单次循环的规则到达终态后自动关闭（不管成功与否）。
+func (e *Engine) closeIfOnce(rule model.Rule, date string) {
+	if rule.CycleOrDefault() != model.CycleOnce {
+		return
+	}
+	if latest, ok := e.store.Rule(rule.ID); ok {
+		if !latest.Enabled {
+			return
+		}
+		latest.Enabled = false
+		if err := e.store.UpsertRule(latest); err != nil {
+			e.log.Warn("单次规则自动关闭失败", "rule", rule.ID, "err", err)
+			return
+		}
+	}
+	e.store.AppendAttempt(model.Attempt{
+		RuleID: rule.ID, RuleName: rule.Name, Date: date,
+		Kind: "session-end", OK: true,
+		Detail: fmt.Sprintf("单次模式规则已处理完目标日期 %s，自动关闭", date),
+	})
+}
+
 // runSession 会话主体：预检重复 -> 逐分钟以固定会议室 ID 直传创建 -> 写终态记录。
 func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, date string, start, end time.Time, intervalSec int, source string) {
 	key := e.sessionKey(rule.ID, date)
@@ -420,8 +425,7 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 		log.Warn("预检搜索失败，继续尝试", "err", err)
 	}
 
-	wd := model.WeekdayKey(start)
-	targets := rule.Weekdays[wd]
+	targets := rule.Rooms
 	// 仅统计携带固定 ID 的会议室（预约直传 ID）。
 	withID := make([]model.RoomRef, 0, len(targets))
 	for _, t := range targets {
@@ -495,6 +499,7 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 		if roomID != "" {
 			_ = e.store.UpsertRoom(roomID, roomName, 0, "record")
 		}
+		e.closeIfOnce(rule, date)
 		e.updateSession(key, func(ss *Session) {
 			ss.AttemptsDone = attempt
 			ss.Status = SessionBooked
@@ -584,6 +589,7 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 			}[status]
 			ss.LastMessage = note
 		})
+		e.closeIfOnce(rule, date)
 		log.Warn(note)
 	}
 }

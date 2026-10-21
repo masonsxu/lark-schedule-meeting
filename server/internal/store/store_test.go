@@ -47,6 +47,15 @@ func TestMigrateLegacyJSON(t *testing.T) {
 	if len(rules) != 1 || rules[0].ID != "rule_old" {
 		t.Fatalf("规则迁移失败: %+v", rules)
 	}
+	if rules[0].Cycle != "weekly" {
+		t.Errorf("旧 weekdays 规则应回填为 weekly 循环，得到 %q", rules[0].Cycle)
+	}
+	if len(rules[0].Rooms) != 1 || rules[0].Rooms[0].ID != "omm_1" {
+		t.Errorf("应取编号最小星期（周一）的会议室列表: %+v", rules[0].Rooms)
+	}
+	if rules[0].StartDate == "" {
+		t.Error("回填后首次目标日期不应为空")
+	}
 	rec, ok := st.RecordOf("rule_old", "2026-11-02")
 	if !ok || rec.Status != model.StatusBooked || rec.RoomID != "omm_1" {
 		t.Fatalf("记录迁移失败: %+v ok=%v", rec, ok)
