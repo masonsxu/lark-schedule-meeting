@@ -44,5 +44,10 @@ export const api = {
       body: JSON.stringify({ start, end, roomNames }),
     }),
 
+  rooms: () => request<Room[]>('/api/rooms'),
+  addRoom: (id: string, name: string) =>
+    request<{ ok: boolean }>('/api/rooms', { method: 'POST', body: JSON.stringify({ id, name }) }),
+  deleteRoom: (id: string) => request<{ ok: boolean }>(`/api/rooms/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   config: () => request<AppConfig>('/api/config'),
 }

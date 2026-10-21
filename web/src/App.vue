@@ -85,7 +85,7 @@ function onEditorSaved() {
     <header class="app-header">
       <div class="brand">
         <h1>会议室抢座台</h1>
-        <p class="tagline">飞书日历循环预约，触发后 10 分钟内每分钟抢一次</p>
+        <p class="tagline">飞书日历循环预约，提前 30 天定时抢，10 分钟窗口每分钟一次</p>
       </div>
       <div class="header-status">
         <span v-if="health?.lark.ok" class="badge badge-booked" title="lark-cli 授权正常">

@@ -1,5 +1,7 @@
-// Package engine 实现周期扫描与抢座会话：到点触发、每分钟一次、窗口 10 分钟、
-// 记录已预约日期并在后续循环跳过。
+// Package engine 实现周期扫描与抢座会话：
+// 目标日期 = 抢座日 + LeadDays（默认 30，公司规则最早可提前 30 天预约）；
+// 抢座日当天到达 TriggerTime 后开抢，窗口内每分钟一次，直接以固定会议室 ID 创建日程；
+// 终态记录写入存储，后续循环跳过已处理日期。
 package engine
 
 import (
@@ -7,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,7 +36,7 @@ type RunOptions struct {
 	IntervalSeconds int
 	// Force 无视已有终态记录强制开跑。
 	Force bool
-	// Date 指定日期（YYYY-MM-DD），空则取今天。
+	// Date 指定目标会议日期（YYYY-MM-DD），空则按今天 + LeadDays 推算。
 	Date string
 }
 
@@ -41,7 +44,7 @@ type RunOptions struct {
 type Session struct {
 	RuleID        string    `json:"ruleId"`
 	RuleName      string    `json:"ruleName"`
-	Date          string    `json:"date"`
+	Date          string    `json:"date"` // 目标会议日期
 	Source        string    `json:"source"`
 	StartedAt     time.Time `json:"startedAt"`
 	Deadline      time.Time `json:"deadline"`
@@ -104,7 +107,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 func (e *Engine) sessionKey(ruleID, date string) string { return ruleID + "|" + date }
 
-// Snapshot 返回全部会话（含已结束，新的在前）。
+// Snapshot 返回全部会话（运行中优先，其余按开始时间倒序）。
 func (e *Engine) Snapshot() []Session {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -112,18 +115,19 @@ func (e *Engine) Snapshot() []Session {
 	for _, s := range e.sessions {
 		out = append(out, *s)
 	}
-	// 运行中优先，其余按开始时间倒序。
 	for i := 0; i < len(out); i++ {
 		for j := i + 1; j < len(out); j++ {
 			si, sj := out[i], out[j]
+			swap := false
 			switch {
 			case si.Status == SessionRunning && sj.Status != SessionRunning:
+				swap = true
 			case si.Status != SessionRunning && sj.Status == SessionRunning:
-				out[i], out[j] = out[j], out[i]
 			case si.StartedAt.Before(sj.StartedAt):
+				swap = true
+			}
+			if swap {
 				out[i], out[j] = out[j], out[i]
-			default:
-				continue
 			}
 		}
 	}
@@ -167,19 +171,37 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// Scan 执行一次扫描：找出今天到触发时刻且尚未处理的规则并启动会话。
+// targetDateFor 返回规则在抢座日 grabDay 对应的目标会议日期（grabDay + LeadDays）。
+func (e *Engine) targetDateFor(rule *model.Rule, grabDay string, loc *time.Location) (time.Time, error) {
+	day, err := time.ParseInLocation("2006-01-02", grabDay, loc)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return day.AddDate(0, 0, rule.LeadDaysOr()), nil
+}
+
+// Scan 执行一次扫描：今天是否为某规则目标日期的抢座日（目标日期 = 今天 + LeadDays），
+// 是且到达 TriggerTime、无终态记录、无运行会话时启动会话。
 func (e *Engine) Scan() {
 	loc := e.location()
 	now := e.now().In(loc)
 	today := now.Format("2006-01-02")
-	wd := model.WeekdayKey(now)
 
 	for _, rule := range e.store.Rules() {
 		if !rule.Enabled {
 			continue
 		}
-		if len(rule.Weekdays[wd]) == 0 {
+		target, err := e.targetDateFor(&rule, today, loc)
+		if err != nil {
 			continue
+		}
+		date := target.Format("2006-01-02")
+		wd := model.WeekdayKey(target)
+		if len(rule.Weekdays[wd]) == 0 {
+			continue // 目标日期不是配置的星期
+		}
+		if rule.SkipWeekendsOn() && (wd == "6" || wd == "7") {
+			continue // 默认跳过周六日
 		}
 		trigger, err := rule.TriggerAt(today, loc)
 		if err != nil {
@@ -189,15 +211,14 @@ func (e *Engine) Scan() {
 		if now.Before(trigger) || now.After(trigger.Add(window)) {
 			continue
 		}
-		if e.store.HasTerminal(rule.ID, today) {
+		if e.store.HasTerminal(rule.ID, date) {
+			continue // 已预约/已处理的日期跳过
+		}
+		if e.hasSession(rule.ID, date) {
 			continue
 		}
-		if e.hasSession(rule.ID, today) {
-			continue
-		}
-		opts := RunOptions{Source: "auto"}
-		if err := e.Start(rule.ID, opts); err != nil {
-			e.log.Warn("启动抢座会话失败", "rule", rule.ID, "date", today, "err", err)
+		if err := e.Start(rule.ID, RunOptions{Source: "auto"}); err != nil {
+			e.log.Warn("启动抢座会话失败", "rule", rule.ID, "date", date, "err", err)
 		}
 	}
 }
@@ -221,7 +242,7 @@ func (e *Engine) intervalOf(rule *model.Rule, opts RunOptions) int {
 	return e.store.Config().GrabIntervalSeconds
 }
 
-// Start 为规则启动一次抢座会话。返回错误当规则不存在、日期非法或已有终态记录。
+// Start 为规则启动一次抢座会话。date 参数为目标会议日期；opts.Date 为空时按今天 + LeadDays 推算。
 func (e *Engine) Start(ruleID string, opts RunOptions) error {
 	rule, ok := e.store.Rule(ruleID)
 	if !ok {
@@ -230,7 +251,11 @@ func (e *Engine) Start(ruleID string, opts RunOptions) error {
 	loc := e.location()
 	date := opts.Date
 	if date == "" {
-		date = e.now().In(loc).Format("2006-01-02")
+		target, err := e.targetDateFor(&rule, e.now().In(loc).Format("2006-01-02"), loc)
+		if err != nil {
+			return err
+		}
+		date = target.Format("2006-01-02")
 	}
 	day, err := time.ParseInLocation("2006-01-02", date, loc)
 	if err != nil {
@@ -238,7 +263,10 @@ func (e *Engine) Start(ruleID string, opts RunOptions) error {
 	}
 	wd := model.WeekdayKey(day)
 	if len(rule.Weekdays[wd]) == 0 {
-		return fmt.Errorf("规则在星期 %s 没有配置会议室", model.WeekdayName(wd))
+		return fmt.Errorf("目标日期 %s 是星期 %s，规则未配置该星期", date, model.WeekdayName(wd))
+	}
+	if rule.SkipWeekendsOn() && (wd == "6" || wd == "7") {
+		return fmt.Errorf("目标日期 %s 是周末，规则已启用跳过周六日", date)
 	}
 	start, end, err := rule.SlotFor(date, loc)
 	if err != nil {
@@ -286,7 +314,6 @@ func (e *Engine) Start(ruleID string, opts RunOptions) error {
 		cancel()
 		return fmt.Errorf("规则在 %s 已有运行中的会话", date)
 	}
-	// 只保留最近 20 条已结束会话。
 	e.pruneLocked()
 	e.sessions[key] = s
 	e.mu.Unlock()
@@ -322,7 +349,7 @@ func (e *Engine) pruneLocked() {
 	}
 }
 
-// UpdateSession 更新会话可观测状态。
+// updateSession 更新会话可观测状态。
 func (e *Engine) updateSession(key string, mut func(*Session)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -334,33 +361,13 @@ func (e *Engine) updateSession(key string, mut func(*Session)) {
 // StopAll 取消所有运行中的会话（进程退出前调用）。
 func (e *Engine) StopAll() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	for _, s := range e.sessions {
 		if s.Status == SessionRunning && s.cancel != nil {
 			s.cancel()
 		}
 	}
+	e.mu.Unlock()
 	e.wg.Wait()
-}
-
-// resolveRoom 在可用列表中按优先级解析目标会议室：
-// 先按 ID 精确匹配，再按名称精确匹配；返回解析出的真实房间（含 room_id）。
-func resolveRoom(targets []model.RoomRef, avail []lark.Room) (lark.Room, bool) {
-	for _, t := range targets {
-		for _, a := range avail {
-			if t.ID != "" && a.ID == t.ID {
-				return a, true
-			}
-		}
-	}
-	for _, t := range targets {
-		for _, a := range avail {
-			if t.Name != "" && a.Name == t.Name {
-				return a, true
-			}
-		}
-	}
-	return lark.Room{}, false
 }
 
 // overlap 判断事件与时间块是否重叠。
@@ -368,7 +375,7 @@ func overlap(ev lark.Event, start, end time.Time) bool {
 	return ev.Start.Before(end) && ev.End.After(start)
 }
 
-// runSession 会话主体：预检重复 -> 逐分钟尝试 -> 写终态记录。
+// runSession 会话主体：预检重复 -> 逐分钟以固定会议室 ID 直传创建 -> 写终态记录。
 func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, date string, start, end time.Time, intervalSec int, source string) {
 	key := e.sessionKey(rule.ID, date)
 	log := e.log.With("rule", rule.Name, "date", date)
@@ -381,7 +388,8 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 	e.store.AppendAttempt(model.Attempt{
 		RuleID: rule.ID, RuleName: rule.Name, Date: date,
 		Kind: "session-start", OK: true,
-		Detail: fmt.Sprintf("窗口 %s，最多尝试 %d 次，间隔 %ds", e.windowOf(&rule), s.MaxAttempts, intervalSec),
+		Detail: fmt.Sprintf("窗口 %s，最多尝试 %d 次，间隔 %ds，提前 %d 天抢目标日期",
+			e.windowOf(&rule), s.MaxAttempts, intervalSec, rule.LeadDaysOr()),
 	})
 
 	// 预检：主日历中若已有本规则同名日程覆盖该时间块，视为已预约，
@@ -413,9 +421,87 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 	}
 
 	wd := model.WeekdayKey(start)
+	targets := rule.Weekdays[wd]
+	// 仅统计携带固定 ID 的会议室（预约直传 ID）。
+	withID := make([]model.RoomRef, 0, len(targets))
+	for _, t := range targets {
+		if strings.TrimSpace(t.ID) != "" {
+			withID = append(withID, t)
+		}
+	}
+	if len(withID) == 0 {
+		note := "规则缺少带 ID 的会议室，无法抢座"
+		if rule.AllowNoRoom {
+			note = "规则无带 ID 会议室，按 allowNoRoom 直接创建无房会议"
+		} else {
+			_ = e.store.UpsertRecord(model.Record{
+				RuleID: rule.ID, RuleName: rule.Name, Date: date,
+				Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339),
+				Status: model.StatusFailed, Source: source, Note: note,
+			})
+			e.store.AppendAttempt(model.Attempt{
+				RuleID: rule.ID, RuleName: rule.Name, Date: date,
+				Kind: "session-end", OK: false, Detail: note,
+			})
+			e.updateSession(key, func(ss *Session) {
+				ss.Status = SessionFailed
+				ss.LastMessage = note
+			})
+			log.Error(note)
+			return
+		}
+	}
+
 	booked := false
-	findOK := false
+	createAttempted := false
 	var lastErr string
+
+	tryCreate := func(attempt int, roomID, roomName string) *lark.Event {
+		createAttempted = true
+		ev, err := e.lark.CreateEvent(ctx, rule.Name, "由 lark-schedule-meeting 自动预约", start, end, roomList(roomID))
+		if err != nil {
+			lastErr = err.Error()
+			display := roomName
+			if display == "" {
+				display = roomID
+			}
+			e.store.AppendAttempt(model.Attempt{
+				RuleID: rule.ID, RuleName: rule.Name, Date: date,
+				Kind: "create", OK: false,
+				Detail: fmt.Sprintf("第 %d 次预定 %s 失败：%v", attempt, display, err),
+			})
+			e.updateSession(key, func(ss *Session) {
+				ss.AttemptsDone = attempt
+				ss.LastMessage = "预定 " + display + " 失败：" + lastErr
+			})
+			return nil
+		}
+		return ev
+	}
+
+	recordBooked := func(attempt int, roomID, roomName, note string, ev *lark.Event) {
+		_ = e.store.UpsertRecord(model.Record{
+			RuleID: rule.ID, RuleName: rule.Name, Date: date,
+			Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339),
+			RoomID: roomID, RoomName: roomName,
+			Status: model.StatusBooked, Source: source,
+			EventID: ev.ID, CalendarID: ev.CalendarID,
+			Note: note, Attempts: attempt,
+		})
+		e.store.AppendAttempt(model.Attempt{
+			RuleID: rule.ID, RuleName: rule.Name, Date: date,
+			Kind: "create", OK: true, Detail: note,
+		})
+		if roomID != "" {
+			_ = e.store.UpsertRoom(roomID, roomName, 0, "record")
+		}
+		e.updateSession(key, func(ss *Session) {
+			ss.AttemptsDone = attempt
+			ss.Status = SessionBooked
+			ss.LastMessage = note
+		})
+		log.Info(note, "room", roomName, "event_id", ev.ID)
+	}
 
 	for attempt := 1; attempt <= s.MaxAttempts && !booked; attempt++ {
 		if ctx.Err() != nil {
@@ -435,117 +521,32 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 			return
 		}
 
-		targets := rule.Weekdays[wd]
-		names := make([]string, 0, len(targets))
-		for _, t := range targets {
-			if t.Name != "" {
-				names = append(names, t.Name)
+		// 按优先级依次以固定 ID 直传创建，第一个成功即结束本轮。
+		for _, room := range withID {
+			if ctx.Err() != nil {
+				return
+			}
+			ev := tryCreate(attempt, room.ID, room.Name)
+			if ev != nil {
+				booked = true
+				note := fmt.Sprintf("第 %d 次尝试成功，已预定 %s", attempt, room.DisplayName())
+				recordBooked(attempt, room.ID, room.DisplayName(), note, ev)
+				return
 			}
 		}
-		avail, err := e.lark.RoomFind(ctx, start, end, names)
-		if err != nil {
-			lastErr = err.Error()
-			e.store.AppendAttempt(model.Attempt{
-				RuleID: rule.ID, RuleName: rule.Name, Date: date,
-				Kind: "find", OK: false, Detail: fmt.Sprintf("第 %d 次：%v", attempt, err),
-			})
-			e.updateSession(key, func(ss *Session) {
-				ss.AttemptsDone = attempt
-				ss.LastMessage = "查询可用会议室失败：" + lastErr
-			})
-		} else {
-			findOK = true
-			room, ok := resolveRoom(targets, avail)
-			if !ok && rule.AllowNoRoom {
-				ev, err := e.lark.CreateEvent(ctx, rule.Name, "由 lark-schedule-meeting 自动预约", start, end, nil)
-				if err != nil {
-					lastErr = err.Error()
-					e.store.AppendAttempt(model.Attempt{
-						RuleID: rule.ID, RuleName: rule.Name, Date: date,
-						Kind: "create", OK: false,
-						Detail: fmt.Sprintf("第 %d 次无会议室预约失败：%v", attempt, err),
-					})
-					e.updateSession(key, func(ss *Session) {
-						ss.AttemptsDone = attempt
-						ss.LastMessage = "无会议室预约失败：" + lastErr
-					})
-				} else {
-					booked = true
-					note := fmt.Sprintf("第 %d 次尝试成功：目标会议室不可用，已按无会议室预约（allowNoRoom）", attempt)
-					_ = e.store.UpsertRecord(model.Record{
-						RuleID: rule.ID, RuleName: rule.Name, Date: date,
-						Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339),
-						Status: model.StatusBooked, Source: source,
-						EventID: ev.ID, CalendarID: ev.CalendarID,
-						Note: note, Attempts: attempt,
-					})
-					e.store.AppendAttempt(model.Attempt{
-						RuleID: rule.ID, RuleName: rule.Name, Date: date,
-						Kind: "create", OK: true, Detail: note,
-					})
-					e.updateSession(key, func(ss *Session) {
-						ss.AttemptsDone = attempt
-						ss.Status = SessionBooked
-						ss.LastMessage = note
-					})
-					log.Info(note, "event_id", ev.ID)
-					return
-				}
-			} else if !ok {
-				busy := make([]string, 0, len(targets))
-				for _, t := range targets {
-					busy = append(busy, t.Name)
-				}
-				detail := fmt.Sprintf("第 %d 次：目标会议室均不可用（%s）", attempt, joinNames(busy))
-				e.store.AppendAttempt(model.Attempt{
-					RuleID: rule.ID, RuleName: rule.Name, Date: date,
-					Kind: "find", OK: true, Detail: detail,
-				})
-				e.updateSession(key, func(ss *Session) {
-					ss.AttemptsDone = attempt
-					ss.LastMessage = detail
-				})
-				if attempt == s.MaxAttempts {
-					break
-				}
-			} else {
-				ev, err := e.lark.CreateEvent(ctx, rule.Name, "由 lark-schedule-meeting 自动预约", start, end, []string{room.ID})
-				if err != nil {
-					lastErr = err.Error()
-					e.store.AppendAttempt(model.Attempt{
-						RuleID: rule.ID, RuleName: rule.Name, Date: date,
-						Kind: "create", OK: false,
-						Detail: fmt.Sprintf("第 %d 次预定 %s 失败：%v", attempt, room.Name, err),
-					})
-					e.updateSession(key, func(ss *Session) {
-						ss.AttemptsDone = attempt
-						ss.LastMessage = "预定 " + room.Name + " 失败：" + lastErr
-					})
-				} else {
-					booked = true
-					note := fmt.Sprintf("第 %d 次尝试成功，已预定 %s", attempt, room.Name)
-					_ = e.store.UpsertRecord(model.Record{
-						RuleID: rule.ID, RuleName: rule.Name, Date: date,
-						Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339),
-						RoomID: room.ID, RoomName: room.Name,
-						Status: model.StatusBooked, Source: source,
-						EventID: ev.ID, CalendarID: ev.CalendarID,
-						Note: note, Attempts: attempt,
-					})
-					e.store.AppendAttempt(model.Attempt{
-						RuleID: rule.ID, RuleName: rule.Name, Date: date,
-						Kind: "create", OK: true, Detail: note,
-					})
-					e.updateSession(key, func(ss *Session) {
-						ss.AttemptsDone = attempt
-						ss.Status = SessionBooked
-						ss.LastMessage = note
-					})
-					log.Info(note, "room", room.Name, "event_id", ev.ID)
-					return
-				}
+
+		// 所有固定 ID 均失败：allowNoRoom 时兜底创建无房会议。
+		if rule.AllowNoRoom {
+			ev := tryCreate(attempt, "", "")
+			if ev != nil {
+				booked = true
+				note := fmt.Sprintf("第 %d 次尝试：目标会议室均失败，已按无会议室预约（allowNoRoom）", attempt)
+				recordBooked(attempt, "", "", note, ev)
+				return
 			}
 		}
+
+		e.updateSession(key, func(ss *Session) { ss.AttemptsDone = attempt })
 
 		// 未成功：按间隔等待后进行下一次尝试。
 		if attempt < s.MaxAttempts {
@@ -560,13 +561,13 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 
 	if !booked {
 		status := model.StatusOccupied
-		note := "抢座窗口结束，目标会议室均不可用"
-		if !findOK {
+		note := "抢座窗口结束，目标会议室均未成功"
+		if lastErr != "" {
+			note += "：" + lastErr
+		}
+		if !createAttempted {
 			status = model.StatusFailed
-			note = "抢座窗口结束，接口调用持续失败"
-			if lastErr != "" {
-				note += "：" + lastErr
-			}
+			note = "抢座窗口结束，未能发起任何预约请求"
 		}
 		_ = e.store.UpsertRecord(model.Record{
 			RuleID: rule.ID, RuleName: rule.Name, Date: date,
@@ -587,13 +588,12 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 	}
 }
 
-func joinNames(names []string) string {
-	out := ""
-	for i, n := range names {
-		if i > 0 {
-			out += "、"
+func roomList(ids ...string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			out = append(out, id)
 		}
-		out += n
 	}
 	return out
 }

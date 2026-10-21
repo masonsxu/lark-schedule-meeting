@@ -54,6 +54,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions", s.handleSessions)
 
 	mux.HandleFunc("POST /api/rooms/available", s.handleRoomsAvailable)
+	mux.HandleFunc("GET /api/rooms", s.handleListRooms)
+	mux.HandleFunc("POST /api/rooms", s.handleAddRoom)
+	mux.HandleFunc("DELETE /api/rooms/{id}", s.handleDeleteRoom)
 
 	// 前端静态资源（存在 web/dist 时）。
 	mux.HandleFunc("/", s.handleStatic)
@@ -337,7 +340,45 @@ func (s *Server) handleRoomsAvailable(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
+	// 检索结果自动进入本地名录（ID 稳定，可长期复用）。
+	for _, room := range rooms {
+		_ = s.store.UpsertRoom(room.ID, room.Name, room.Capacity, "room-find")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"start": body.Start, "end": body.End, "rooms": rooms})
+}
+
+// ---- rooms directory ----
+
+func (s *Server) handleListRooms(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.store.Rooms())
+}
+
+func (s *Server) handleAddRoom(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(body.ID) == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("会议室 ID（omm_ 开头）不能为空"))
+		return
+	}
+	if err := s.store.UpsertRoom(body.ID, body.Name, 0, "manual"); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteRoom(w http.ResponseWriter, r *http.Request) {
+	if !s.store.DeleteRoom(r.PathValue("id")) {
+		writeErr(w, http.StatusNotFound, errors.New("名录中不存在该会议室"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // ---- static ----

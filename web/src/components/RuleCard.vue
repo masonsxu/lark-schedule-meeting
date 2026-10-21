@@ -18,22 +18,24 @@ const latestRecord = computed(() =>
   [...props.records].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0],
 )
 
-/** 下一个可触发的日期（含今天）。 */
-function nextRunDate(rule: Rule): string {
+/** 下一次抢座计划：抢座日 + 时刻 -> 目标会议日期。 */
+function nextGrab(rule: Rule): { grabDate: string; targetDate: string } | null {
   const keys: string[] = WEEKDAY_KEYS.filter((k) => (rule.weekdays[k] ?? []).length > 0)
-  if (keys.length === 0) return ''
+  if (keys.length === 0) return null
+  const lead = rule.leadDays && rule.leadDays > 0 ? rule.leadDays : 30
+  const skipWE = rule.skipWeekends !== false
+  const fmt = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   const now = new Date()
-  for (let i = 0; i < 8; i++) {
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i)
-    const iso = String((d.getDay() === 0 ? 7 : d.getDay()))
-    if (keys.includes(iso)) {
-      const y = d.getFullYear()
-      const m = String(d.getMonth() + 1).padStart(2, '0')
-      const day = String(d.getDate()).padStart(2, '0')
-      return `${y}-${m}-${day}`
-    }
+  for (let i = 0; i < 75; i++) {
+    const gd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i)
+    const td = new Date(gd.getFullYear(), gd.getMonth(), gd.getDate() + lead)
+    const iso = String(td.getDay() === 0 ? 7 : td.getDay())
+    if (!keys.includes(iso)) continue
+    if (skipWE && (iso === '6' || iso === '7')) continue
+    return { grabDate: fmt(gd), targetDate: fmt(td) }
   }
-  return ''
+  return null
 }
 
 async function toggleEnabled() {
@@ -53,8 +55,8 @@ async function runNow() {
   busy.value = true
   error.value = ''
   try {
-    const date = nextRunDate(props.rule)
-    await api.runRule(props.rule.id, { date })
+    const plan = nextGrab(props.rule)
+    await api.runRule(props.rule.id, { date: plan?.targetDate })
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -94,8 +96,12 @@ async function remove() {
         <dd class="mono">{{ rule.startTime }} – {{ rule.endTime }}</dd>
       </div>
       <div class="meta-row">
-        <dt>触发时刻</dt>
-        <dd class="mono">{{ rule.triggerTime }}</dd>
+        <dt>抢座开始</dt>
+        <dd class="mono">{{ rule.triggerTime }}（提前 {{ rule.leadDays && rule.leadDays > 0 ? rule.leadDays : 30 }} 天）</dd>
+      </div>
+      <div v-if="nextGrab(rule)" class="meta-row">
+        <dt>下次抢座</dt>
+        <dd class="mono">{{ nextGrab(rule)!.grabDate }} {{ rule.triggerTime }} → 目标 {{ nextGrab(rule)!.targetDate }}</dd>
       </div>
     </dl>
 
@@ -105,7 +111,7 @@ async function remove() {
         :key="k"
         class="chip"
         :class="{ on: activeWeekdays.includes(k) }"
-        :title="activeWeekdays.includes(k) ? rule.weekdays[k].map((r) => r.name).join(' → ') : ''"
+        :title="activeWeekdays.includes(k) ? rule.weekdays[k].map((r) => r.name || r.id).join(' → ') : ''"
       >
         {{ WEEKDAY_NAMES[k] }}
       </span>
@@ -122,7 +128,7 @@ async function remove() {
     <p v-if="error" class="card-error" role="alert">{{ error }}</p>
 
     <div class="card-actions">
-      <button class="btn btn-sm" type="button" :disabled="busy" @click="runNow" :title="`下一次触发日期 ${nextRunDate(rule)}`">
+      <button class="btn btn-sm" type="button" :disabled="busy" @click="runNow" :title="`立即抢目标日期 ${nextGrab(rule)?.targetDate ?? ''}`">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
         </svg>

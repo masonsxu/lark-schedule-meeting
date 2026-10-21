@@ -72,13 +72,24 @@ func (c *CLI) run(ctx context.Context, args ...string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return nil, fmt.Errorf("lark-cli %s 执行失败: %s", args[0], truncate(msg, 400))
+		return nil, fmt.Errorf("lark-cli %s 执行失败: %s", args[0], compactError(stderr.String(), err))
 	}
 	return stdout.Bytes(), nil
+}
+
+// compactError 从 stderr 提取可读错误：优先解析 JSON 信封中的 error 字段，避免原始 JSON 刷屏。
+func compactError(stderr string, cause error) string {
+	msg := strings.TrimSpace(stderr)
+	if msg == "" {
+		return cause.Error()
+	}
+	var env struct {
+		Error *cliError `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(msg), &env); err == nil && env.Error != nil {
+		return truncate(env.Error.Error(), 300)
+	}
+	return truncate(msg, 300)
 }
 
 // envelope lark-cli 统一输出信封。

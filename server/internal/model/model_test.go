@@ -58,7 +58,7 @@ func TestTriggerAt(t *testing.T) {
 func TestValidate(t *testing.T) {
 	good := &Rule{
 		Name:        "站会",
-		Weekdays:    map[string][]RoomRef{"1": {{ID: "omm_1", Name: "1"}}, "3": {{Name: "4"}}},
+		Weekdays:    map[string][]RoomRef{"1": {{ID: "omm_1", Name: "1"}}, "3": {{ID: "omm_4"}}},
 		StartTime:   "10:00",
 		EndTime:     "10:30",
 		TriggerTime: "09:00",

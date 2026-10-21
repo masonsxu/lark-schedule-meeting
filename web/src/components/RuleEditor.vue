@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
 import type { Rule, RoomRef } from '../types'
 import { WEEKDAY_KEYS, WEEKDAY_NAMES } from '../types'
-import RoomPicker from './RoomPicker.vue'
+import RoomPanel from './RoomPanel.vue'
 
 const props = defineProps<{ rule: Rule | null }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
@@ -15,6 +15,8 @@ interface DraftRule {
   startTime: string
   endTime: string
   triggerTime: string
+  leadDays: number
+  skipWeekends: boolean
   enabled: boolean
   allowNoRoom: boolean
 }
@@ -27,6 +29,8 @@ function emptyDraft(): DraftRule {
     startTime: '10:00',
     endTime: '11:00',
     triggerTime: '09:00',
+    leadDays: 30,
+    skipWeekends: true,
     enabled: true,
     allowNoRoom: false,
   }
@@ -50,6 +54,8 @@ onMounted(() => {
       startTime: props.rule.startTime,
       endTime: props.rule.endTime,
       triggerTime: props.rule.triggerTime,
+      leadDays: props.rule.leadDays && props.rule.leadDays > 0 ? props.rule.leadDays : 30,
+      skipWeekends: props.rule.skipWeekends !== false,
       enabled: props.rule.enabled,
       allowNoRoom: props.rule.allowNoRoom ?? false,
     }
@@ -95,8 +101,8 @@ function toggleWeekday(k: string) {
 
 function addRoom(room: { id: string; name: string }) {
   const list = draft.value.weekdays[targetWeekday.value] ?? (draft.value.weekdays[targetWeekday.value] = [])
-  if (list.some((r) => r.id === room.id && r.name === room.name)) return
-  list.push({ ...room })
+  if (list.some((r) => r.id === room.id)) return
+  list.push({ id: room.id, name: room.name ?? '' })
 }
 
 function moveRoom(k: string, index: number, delta: -1 | 1) {
@@ -118,7 +124,14 @@ function validate(): string[] {
   const errs: string[] = []
   if (!draft.value.name.trim()) errs.push('会议主题不能为空')
   if (activeCount.value === 0) errs.push('至少为一个星期配置会议室')
+  for (const k of WEEKDAY_KEYS) {
+    const rooms = draft.value.weekdays[k] ?? []
+    for (const room of rooms) {
+      if (!room.id.trim()) errs.push(`星期 ${WEEKDAY_NAMES[k]} 的会议室 ${room.name || '（未命名）'} 缺少 ID`)
+    }
+  }
   if (draft.value.endTime <= draft.value.startTime) errs.push('会议结束时间必须晚于开始时间')
+  if (!(draft.value.leadDays >= 0 && draft.value.leadDays <= 365)) errs.push('提前天数应在 0-365 之间')
   return errs
 }
 
@@ -188,15 +201,23 @@ async function save() {
               <input id="rule-end" v-model="draft.endTime" type="time" required />
             </div>
             <div class="field">
-              <label for="rule-trigger">触发时刻</label>
+              <label for="rule-trigger">抢座开始时刻</label>
               <input id="rule-trigger" v-model="draft.triggerTime" type="time" required />
+            </div>
+            <div class="field">
+              <label for="rule-lead">提前天数</label>
+              <input id="rule-lead" v-model.number="draft.leadDays" type="number" min="0" max="365" required />
             </div>
             <div class="field span-2">
               <label for="rule-desc">备注（写入日程描述，可选）</label>
               <input id="rule-desc" v-model="draft.description" type="text" placeholder="可选" />
             </div>
           </div>
-          <p class="hint">触发时刻起 10 分钟内，每分钟尝试一次抢会议室；失败记入记录，下次循环自动跳过已约日期。</p>
+          <p class="hint">
+            目标日期 = 抢座日 + 提前天数（默认 30：公司规则为会议室最早可提前 30 天预约）。
+            抢座日到达"抢座开始时刻"后开抢：10 分钟窗口内每分钟一次，按优先级以固定会议室 ID 直传预约；
+            失败记入 SQLite 记录，后续循环自动跳过已处理日期。
+          </p>
         </fieldset>
 
         <fieldset class="form-section">
@@ -208,11 +229,12 @@ async function save() {
                 <span>{{ WEEKDAY_NAMES[k] }}</span>
               </label>
               <div v-if="isDayOn(k)" class="rooms">
-                <span v-for="(room, i) in draft.weekdays[k]" :key="room.id + room.name" class="room-chip">
+                <span v-for="(room, i) in draft.weekdays[k]" :key="room.id" class="room-chip">
                   <span class="room-priority mono">{{ i + 1 }}</span>
-                  <span class="room-chip-name" :title="room.id ? `${room.name} (${room.id})` : `${room.name}（预约时按名称解析）`">
-                    {{ room.name }}
+                  <span class="room-chip-name" :title="`${room.name || ''} ${room.id}`">
+                    {{ room.name || room.id }}
                   </span>
+                  <span class="room-chip-id mono">{{ room.id }}</span>
                   <button type="button" class="chip-btn" :disabled="i === 0" aria-label="上移" @click="moveRoom(k, i, -1)">↑</button>
                   <button type="button" class="chip-btn" :disabled="i === draft.weekdays[k].length - 1" aria-label="下移" @click="moveRoom(k, i, 1)">↓</button>
                   <button type="button" class="chip-btn chip-remove" aria-label="移除" @click="removeRoom(k, i)">×</button>
@@ -230,7 +252,7 @@ async function save() {
               <option v-if="activeCount === 0" value="" disabled>请先勾选星期</option>
             </select>
           </div>
-          <RoomPicker
+          <RoomPanel
             v-if="WEEKDAY_KEYS.some(isDayOn)"
             :default-start="draft.startTime"
             :default-end="draft.endTime"
@@ -245,8 +267,12 @@ async function save() {
             <span>启用规则（停用后调度器不再触发）</span>
           </label>
           <label class="check-row">
+            <input v-model="draft.skipWeekends" type="checkbox" />
+            <span>目标日期落在周六/周日时跳过（默认开启）</span>
+          </label>
+          <label class="check-row">
             <input v-model="draft.allowNoRoom" type="checkbox" />
-            <span>会议室全不可用时仍创建无房会议（内网外验证链路时使用）</span>
+            <span>会议室全部预约失败时仍创建无房会议</span>
           </label>
         </fieldset>
       </form>
@@ -422,7 +448,17 @@ async function save() {
 }
 
 .room-chip-name {
-  max-width: 180px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-chip-id {
+  font-size: 11px;
+  color: var(--accent);
+  opacity: 0.85;
+  max-width: 130px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

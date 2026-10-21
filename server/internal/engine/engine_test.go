@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -13,20 +14,16 @@ import (
 	"github.com/masonsxu/lark-schedule-meeting/server/internal/store"
 )
 
-// fakeLark 引擎测试替身。
+// fakeLark 引擎测试替身。CreateEvent 按 roomID 决定成败，模拟房间被占。
 type fakeLark struct {
 	mu sync.Mutex
 
-	rooms     []lark.Room // RoomFind 返回值
-	findErr   error
-	events    []lark.Event // SearchEvents 返回值
-	createErr error
-	// releaseAfter 非零时：前 N-1 次查询返回空房，第 N 次起返回 rooms。
-	releaseAfter int
+	createErrFor map[string]error // roomID -> 失败原因
+	createAllErr error
+	events       []lark.Event // SearchEvents 返回值
 
 	findCalls   int
 	createCalls []createdEvent
-	deleteCalls []string
 }
 
 type createdEvent struct {
@@ -43,18 +40,20 @@ func (f *fakeLark) RoomFind(ctx context.Context, start, end time.Time, roomNames
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.findCalls++
-	if f.findCalls < f.releaseAfter {
-		return nil, f.findErr
-	}
-	return f.rooms, f.findErr
+	return nil, nil
 }
 
 func (f *fakeLark) CreateEvent(ctx context.Context, summary, description string, start, end time.Time, roomIDs []string) (*lark.Event, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, createdEvent{summary: summary, roomIDs: roomIDs, start: start})
-	if f.createErr != nil {
-		return nil, f.createErr
+	if f.createAllErr != nil {
+		return nil, f.createAllErr
+	}
+	for _, id := range roomIDs {
+		if err, ok := f.createErrFor[id]; ok {
+			return nil, err
+		}
 	}
 	return &lark.Event{ID: "ev_fake", CalendarID: "primary", Summary: summary, Start: start, End: end}, nil
 }
@@ -66,9 +65,6 @@ func (f *fakeLark) SearchEvents(ctx context.Context, query string, startDay, end
 }
 
 func (f *fakeLark) DeleteEvent(ctx context.Context, calendarID, eventID string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.deleteCalls = append(f.deleteCalls, eventID)
 	return nil
 }
 
@@ -152,7 +148,9 @@ func (e *testEnv) waitSessionStatus(t *testing.T, ruleID, date, want string) Ses
 	}
 }
 
-// monWedRule 周一可约 A/B/C，周三可约 D/E —— 对应需求的规则形态。
+func boolPtr(b bool) *bool { return &b }
+
+// monWedRule 周一可约 A/B/C，周三可约 D/E；提前 30 天抢。
 func monWedRule() model.Rule {
 	return model.Rule{
 		ID:          "rule_test",
@@ -161,6 +159,7 @@ func monWedRule() model.Rule {
 		StartTime:   "10:00",
 		EndTime:     "11:00",
 		TriggerTime: "09:00",
+		LeadDays:    30,
 		Enabled:     true,
 	}
 }
@@ -180,63 +179,79 @@ func roomDE() []model.RoomRef {
 	}
 }
 
+// grabDayFor 返回“目标日期 - 30 天”的抢座日。
+func grabDayFor(target time.Time) time.Time {
+	return target.AddDate(0, 0, -30)
+}
+
 // ---- 场景测试 ----
 
-// 场景 1：周一到点触发，按优先级预定第一间可用会议室，并写终态记录；
-// 同一日期重复扫描不再触发（跳过已被预约的日期）。
-func TestScanBooksFirstAvailableOnMonday(t *testing.T) {
+// 场景 1：抢座日到点触发，按优先级以固定 ID 直传创建；
+// A 被占则落到 B；目标日期 = 抢座日 + 30；终态记录后重复扫描不再触发。
+func TestScanBooksByFixedRoomID(t *testing.T) {
 	loc := mustLoc(t)
-	monday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday)
-	env := newEnv(t, monday.Add(9*time.Hour+5*time.Minute)) // 09:05，处于 [09:00,09:10) 窗口内
+	target := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday) // 目标会议日：周一
+	grabDay := grabDayFor(target)
+	env := newEnv(t, grabDay.Add(9*time.Hour+5*time.Minute)) // 09:05 处于抢座窗口
 	rule := monWedRule()
 	if err := env.store.UpsertRule(rule); err != nil {
 		t.Fatal(err)
 	}
-	// A 不可用，B、C 可用 → 应选 B。
-	env.fake.rooms = []lark.Room{{ID: "omm_B", Name: "会议室B"}, {ID: "omm_C", Name: "会议室C"}}
+	env.fake.mu.Lock()
+	env.fake.createErrFor = map[string]error{"omm_A": errors.New("会议室已被占用")}
+	env.fake.mu.Unlock()
 
 	env.engine.Scan()
-	s := env.waitSessionStatus(t, rule.ID, monday.Format("2006-01-02"), SessionBooked)
+	date := target.Format("2006-01-02")
+	s := env.waitSessionStatus(t, rule.ID, date, SessionBooked)
+
+	finds, creates := env.fake.stats()
+	if finds != 0 {
+		t.Errorf("抢座路径不应调用 room-find，调用了 %d 次", finds)
+	}
+	if len(creates) != 2 {
+		t.Fatalf("应先试 A（失败）再试 B（成功），共 2 次创建，得到 %d", len(creates))
+	}
+	if creates[0].roomIDs[0] != "omm_A" || creates[1].roomIDs[0] != "omm_B" {
+		t.Errorf("优先级顺序错误: %+v", creates)
+	}
 	if s.AttemptsDone != 1 {
-		t.Errorf("第一次尝试即应成功，attempts=%d", s.AttemptsDone)
+		t.Errorf("第一轮尝试即应成功，attempts=%d", s.AttemptsDone)
 	}
-	_, creates := env.fake.stats()
-	if len(creates) != 1 {
-		t.Fatalf("应恰好创建 1 个日程，得到 %d", len(creates))
-	}
-	if creates[0].roomIDs[0] != "omm_B" {
-		t.Errorf("应预定优先级最高的可用会议室 B，得到 %v", creates[0].roomIDs)
-	}
-	rec, ok := env.store.RecordOf(rule.ID, monday.Format("2006-01-02"))
+	rec, ok := env.store.RecordOf(rule.ID, date)
 	if !ok || rec.Status != model.StatusBooked || rec.RoomID != "omm_B" {
 		t.Fatalf("终态记录错误: %+v ok=%v", rec, ok)
 	}
+	// 成功预约的会议室应自动进入名录。
+	rooms := env.store.Rooms()
+	if len(rooms) != 1 || rooms[0].ID != "omm_B" {
+		t.Errorf("成功会议室应回写名录: %+v", rooms)
+	}
 
-	// 再次扫描：已有终态记录，不得再次预约。
+	// 再次扫描：已有终态记录，不得重复预约。
 	env.engine.Scan()
-	waitFor(t, func() bool {
-		_, creates := env.fake.stats()
-		return len(creates) > 1
-	}, "不应重复创建", wantFalse)
+	waitQuiet(t)
 	_, creates2 := env.fake.stats()
-	if len(creates2) != 1 {
+	if len(creates2) != 2 {
 		t.Errorf("重复扫描不应再创建日程，创建次数=%d", len(creates2))
 	}
 }
 
-// 场景 2：目标会议室全部被占 → 窗口结束写 occupied 终态；再次 Start 被拒绝。
-func TestOccupiedRecordsAndSkipsNextCycle(t *testing.T) {
+// 场景 2：所有固定 ID 均失败 -> 窗口结束写 occupied 终态；再次 Start 被拒绝。
+func TestOccupiedWhenAllRoomsFail(t *testing.T) {
 	loc := mustLoc(t)
-	wednesday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Wednesday)
-	env := newEnv(t, wednesday.Add(9*time.Hour))
+	target := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Wednesday)
+	env := newEnv(t, target.Add(9*time.Hour))
 	rule := monWedRule()
 	if err := env.store.UpsertRule(rule); err != nil {
 		t.Fatal(err)
 	}
-	env.fake.rooms = nil // 无可用会议室
+	env.fake.mu.Lock()
+	env.fake.createAllErr = errors.New("会议室时间冲突")
+	env.fake.mu.Unlock()
 
-	date := wednesday.Format("2006-01-02")
-	if err := env.engine.Start(rule.ID, RunOptions{Source: "auto", MaxAttempts: 3, IntervalSeconds: 1}); err != nil {
+	date := target.Format("2006-01-02")
+	if err := env.engine.Start(rule.ID, RunOptions{Source: "auto", MaxAttempts: 2, IntervalSeconds: 1, Date: date}); err != nil {
 		t.Fatal(err)
 	}
 	env.waitSessionStatus(t, rule.ID, date, SessionOccupied)
@@ -245,49 +260,130 @@ func TestOccupiedRecordsAndSkipsNextCycle(t *testing.T) {
 	if !ok || rec.Status != model.StatusOccupied {
 		t.Fatalf("应写 occupied 记录: %+v ok=%v", rec, ok)
 	}
-	finds, creates := env.fake.stats()
-	if finds != 3 {
-		t.Errorf("3 次尝试应调用 3 次 room-find，得到 %d", finds)
+	_, creates := env.fake.stats()
+	// 2 轮尝试 x 2 间会议室 = 4 次创建。
+	if len(creates) != 4 {
+		t.Errorf("2 轮 x 2 间会议室应创建 4 次，得到 %d", len(creates))
 	}
-	if len(creates) != 0 {
-		t.Errorf("无可用会议室时不应创建日程，得到 %d", len(creates))
-	}
-	// 下次循环（同日再触发）应被终态记录拦截。
-	if err := env.engine.Start(rule.ID, RunOptions{Source: "auto"}); err == nil {
+	if err := env.engine.Start(rule.ID, RunOptions{Source: "auto", Date: date}); err == nil {
 		t.Error("已有终态记录时再次启动应报错")
 	}
 }
 
-// 场景 3：前几轮全部被占，之后释放 → 按优先级抢到。
-func TestRetriesUntilRoomFreed(t *testing.T) {
+// 场景 3：仅配置名称（无固定 ID）时 failed；allowNoRoom 则直接创建无房会议。
+func TestNoIDRoomsBehavior(t *testing.T) {
 	loc := mustLoc(t)
-	monday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday)
-	env := newEnv(t, monday.Add(9*time.Hour))
-	rule := monWedRule()
+	target := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday)
+	date := target.Format("2006-01-02")
+
+	t.Run("无ID且未开allowNoRoom", func(t *testing.T) {
+		env := newEnv(t, target.Add(9*time.Hour))
+		rule := model.Rule{
+			ID: "rule_noID", Name: "周会",
+			Weekdays:  map[string][]model.RoomRef{"1": {{Name: "1"}}},
+			StartTime: "10:00", EndTime: "11:00", TriggerTime: "09:00", LeadDays: 30, Enabled: true,
+		}
+		if err := env.store.UpsertRule(rule); err != nil {
+			t.Fatal(err)
+		}
+		if err := env.engine.Start(rule.ID, RunOptions{Date: date}); err != nil {
+			t.Fatal(err)
+		}
+		env.waitSessionStatus(t, rule.ID, date, SessionFailed)
+		rec, _ := env.store.RecordOf(rule.ID, date)
+		if rec.Status != model.StatusFailed {
+			t.Fatalf("应写 failed: %+v", rec)
+		}
+		if _, creates := env.fake.stats(); len(creates) != 0 {
+			t.Errorf("不应发起创建，得到 %d 次", len(creates))
+		}
+	})
+
+	t.Run("无ID但allowNoRoom", func(t *testing.T) {
+		env := newEnv(t, target.Add(9*time.Hour))
+		rule := model.Rule{
+			ID: "rule_noID2", Name: "站会",
+			Weekdays:  map[string][]model.RoomRef{"1": {{Name: "1"}}},
+			StartTime: "10:00", EndTime: "11:00", TriggerTime: "09:00", LeadDays: 30, Enabled: true,
+			AllowNoRoom: true,
+		}
+		if err := env.store.UpsertRule(rule); err != nil {
+			t.Fatal(err)
+		}
+		if err := env.engine.Start(rule.ID, RunOptions{Date: date}); err != nil {
+			t.Fatal(err)
+		}
+		env.waitSessionStatus(t, rule.ID, date, SessionBooked)
+		_, creates := env.fake.stats()
+		if len(creates) != 1 || len(creates[0].roomIDs) != 0 {
+			t.Errorf("应创建一次无房日程: %+v", creates)
+		}
+	})
+}
+
+// 场景 4：目标日期落在周六：默认跳过；显式关闭 skipWeekends 才允许。
+func TestSkipWeekends(t *testing.T) {
+	loc := mustLoc(t)
+	saturday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Saturday)
+	grabDay := grabDayFor(saturday)
+
+	// 默认（nil = true）：扫描不触发。
+	env := newEnv(t, grabDay.Add(9*time.Hour+5*time.Minute))
+	rule := model.Rule{
+		ID: "rule_sat", Name: "周六会",
+		Weekdays:  map[string][]model.RoomRef{"6": {{ID: "omm_S", Name: "S"}}},
+		StartTime: "10:00", EndTime: "11:00", TriggerTime: "09:00", LeadDays: 30, Enabled: true,
+	}
 	if err := env.store.UpsertRule(rule); err != nil {
 		t.Fatal(err)
 	}
-	// 前 2 次查询无房，第 3 次 A 释放（按调用次数驱动，确定性时序）。
-	env.fake.mu.Lock()
-	env.fake.releaseAfter = 3
-	env.fake.rooms = []lark.Room{{ID: "omm_A", Name: "会议室A"}}
-	env.fake.mu.Unlock()
+	env.engine.Scan()
+	waitQuiet(t)
+	if sessions := env.engine.Snapshot(); len(sessions) != 0 {
+		t.Errorf("默认应跳过周六目标日期: %+v", sessions)
+	}
+	// 手动触发周六也应被拒。
+	if err := env.engine.Start(rule.ID, RunOptions{Date: saturday.Format("2006-01-02")}); err == nil {
+		t.Error("手动触发周末目标日期应报错")
+	}
 
-	date := monday.Format("2006-01-02")
-	if err := env.engine.Start(rule.ID, RunOptions{Source: "auto", MaxAttempts: 5, IntervalSeconds: 1}); err != nil {
+	// 显式关闭 skipWeekends：允许触发。
+	env2 := newEnv(t, grabDay.Add(9*time.Hour+5*time.Minute))
+	rule2 := rule
+	rule2.ID = "rule_sat2"
+	rule2.SkipWeekends = boolPtr(false)
+	if err := env2.store.UpsertRule(rule2); err != nil {
 		t.Fatal(err)
 	}
-	s := env.waitSessionStatus(t, rule.ID, date, SessionBooked)
-	if s.AttemptsDone != 3 {
-		t.Errorf("第 3 次尝试应成功，attempts=%d", s.AttemptsDone)
+	env2.engine.Scan()
+	env2.waitSessionStatus(t, rule2.ID, saturday.Format("2006-01-02"), SessionBooked)
+}
+
+// 场景 5：目标日期星期与规则不匹配时不触发。
+func TestScanSkipsNonMatchingTargetWeekday(t *testing.T) {
+	loc := mustLoc(t)
+	tuesday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Tuesday)
+	grabDay := grabDayFor(tuesday)
+	env := newEnv(t, grabDay.Add(9*time.Hour+5*time.Minute))
+	if err := env.store.UpsertRule(monWedRule()); err != nil {
+		t.Fatal(err)
 	}
-	_, creates := env.fake.stats()
-	if len(creates) != 1 || creates[0].roomIDs[0] != "omm_A" {
-		t.Errorf("应预定 A: %+v", creates)
+	env.engine.Scan()
+	waitQuiet(t)
+	if sessions := env.engine.Snapshot(); len(sessions) != 0 {
+		t.Errorf("目标日期周二不应启动会话: %+v", sessions)
+	}
+	// 触发时刻之前同样不触发（目标为周一时，抢座日 08:00）。
+	monday := nextWeekdayFrom(tuesday, time.Monday)
+	env.setNow(grabDayFor(monday).Add(8 * time.Hour))
+	env.engine.Scan()
+	waitQuiet(t)
+	for _, s := range env.engine.Snapshot() {
+		t.Errorf("触发时刻之前不应启动会话: %+v", s)
 	}
 }
 
-// 场景 4：预检发现本规则同名日程已覆盖时间块 → 记录 booked(detected) 且不重复创建。
+// 场景 6：预检发现本规则同名日程已覆盖时间块 -> 记录 booked(detected) 且不重复创建。
 func TestDuplicateDetectionSkips(t *testing.T) {
 	loc := mustLoc(t)
 	monday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday)
@@ -302,7 +398,7 @@ func TestDuplicateDetectionSkips(t *testing.T) {
 	}}
 
 	date := monday.Format("2006-01-02")
-	if err := env.engine.Start(rule.ID, RunOptions{Source: "manual"}); err != nil {
+	if err := env.engine.Start(rule.ID, RunOptions{Source: "manual", Date: date}); err != nil {
 		t.Fatal(err)
 	}
 	env.waitSessionStatus(t, rule.ID, date, SessionBooked)
@@ -316,64 +412,29 @@ func TestDuplicateDetectionSkips(t *testing.T) {
 	}
 }
 
-// 场景 5：星期不匹配不触发（周二既有周一规则也有周三规则，都不该跑）。
-func TestScanSkipsNonMatchingWeekday(t *testing.T) {
+// 场景 7：手动触发未指定日期时，按今天 + LeadDays 推算目标日期。
+func TestManualRunDefaultDate(t *testing.T) {
 	loc := mustLoc(t)
-	tuesday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Tuesday)
-	env := newEnv(t, tuesday.Add(9*time.Hour+5*time.Minute))
-	if err := env.store.UpsertRule(monWedRule()); err != nil {
-		t.Fatal(err)
-	}
-	env.engine.Scan()
-	time.Sleep(20 * time.Millisecond)
-	for _, s := range env.engine.Snapshot() {
-		t.Errorf("周二不应启动会话: %+v", s)
-	}
-	// 触发时刻之前也不触发（周一 08:00）。
-	monday := nextWeekdayFrom(tuesday, time.Monday)
-	env.setNow(monday.Add(8 * time.Hour))
-	env.engine.Scan()
-	time.Sleep(20 * time.Millisecond)
-	for _, s := range env.engine.Snapshot() {
-		t.Errorf("触发时刻之前不应启动会话: %+v", s)
-	}
-	// 窗口结束后同样不触发（周一 09:11，窗口 10 分钟）。
-	env.setNow(monday.Add(9*time.Hour + 11*time.Minute))
-	env.engine.Scan()
-	time.Sleep(20 * time.Millisecond)
-	for _, s := range env.engine.Snapshot() {
-		t.Errorf("窗口结束后不应启动会话: %+v", s)
-	}
-}
-
-// 场景 6：仅配置名称（公司内网外无法提前拿到 room_id）也能在运行时按名称解析。
-func TestNameOnlyRoomResolution(t *testing.T) {
-	loc := mustLoc(t)
-	monday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday)
-	env := newEnv(t, monday.Add(9*time.Hour))
+	now := time.Date(2026, 10, 20, 21, 0, 0, 0, loc) // 周二
+	// 今天 + 30 天后的星期配进规则。
+	target := now.AddDate(0, 0, 30)
+	env := newEnv(t, now)
 	rule := model.Rule{
-		ID: "rule_nameonly", Name: "站会",
-		Weekdays:  map[string][]model.RoomRef{"1": {{Name: "3"}, {Name: "5"}}},
-		StartTime: "10:00", EndTime: "10:30", TriggerTime: "09:00", Enabled: true,
+		ID: "rule_manual", Name: "手动会",
+		Weekdays:  map[string][]model.RoomRef{model.WeekdayKey(target): {{ID: "omm_T", Name: "T"}}},
+		StartTime: "10:00", EndTime: "11:00", TriggerTime: "09:00", LeadDays: 30, Enabled: true,
 	}
 	if err := env.store.UpsertRule(rule); err != nil {
 		t.Fatal(err)
 	}
-	env.fake.rooms = []lark.Room{{ID: "omm_5", Name: "5"}}
-
-	date := monday.Format("2006-01-02")
 	if err := env.engine.Start(rule.ID, RunOptions{Source: "manual"}); err != nil {
 		t.Fatal(err)
 	}
-	env.waitSessionStatus(t, rule.ID, date, SessionBooked)
-	_, creates := env.fake.stats()
-	if len(creates) != 1 || creates[0].roomIDs[0] != "omm_5" {
-		t.Fatalf("应通过名称解析并预定 5 号会议室: %+v", creates)
-	}
+	env.waitSessionStatus(t, rule.ID, target.Format("2006-01-02"), SessionBooked)
 }
 
-// 场景 7：接口持续失败 → failed 终态。
-func TestPersistentErrorsRecordFailed(t *testing.T) {
+// 场景 8：SQLite 持久化——重开数据库后规则、记录、名录仍在。
+func TestSqlitePersistence(t *testing.T) {
 	loc := mustLoc(t)
 	monday := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday)
 	env := newEnv(t, monday.Add(9*time.Hour))
@@ -381,42 +442,45 @@ func TestPersistentErrorsRecordFailed(t *testing.T) {
 	if err := env.store.UpsertRule(rule); err != nil {
 		t.Fatal(err)
 	}
-	env.fake.mu.Lock()
-	env.fake.findErr = context.DeadlineExceeded
-	env.fake.mu.Unlock()
-
 	date := monday.Format("2006-01-02")
-	if err := env.engine.Start(rule.ID, RunOptions{Source: "manual", MaxAttempts: 2, IntervalSeconds: 1}); err != nil {
+	if err := env.store.UpsertRecord(model.Record{
+		RuleID: rule.ID, RuleName: rule.Name, Date: date,
+		Start: "2026-11-16T10:00:00+08:00", End: "2026-11-16T11:00:00+08:00",
+		Status: model.StatusBooked, Source: "auto", RoomID: "omm_A", RoomName: "会议室A",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	env.waitSessionStatus(t, rule.ID, date, SessionFailed)
-	rec, ok := env.store.RecordOf(rule.ID, date)
-	if !ok || rec.Status != model.StatusFailed {
-		t.Fatalf("应写 failed 记录: %+v ok=%v", rec, ok)
+	if err := env.store.UpsertRoom("omm_A", "会议室A", 7, "manual"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重开同一数据目录。
+	cfg := config.Default()
+	cfg.DataDir = env.store.Config().DataDir
+	st2, err := store.Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := st2.Rules()
+	if len(rules) != 1 || rules[0].ID != rule.ID {
+		t.Fatalf("规则未持久化: %+v", rules)
+	}
+	if got := rules[0].LeadDaysOr(); got != 30 {
+		t.Errorf("leadDays 未持久化: %d", got)
+	}
+	if rec, ok := st2.RecordOf(rule.ID, date); !ok || rec.Status != model.StatusBooked {
+		t.Fatalf("记录未持久化: %+v ok=%v", rec, ok)
+	}
+	if !st2.HasTerminal(rule.ID, date) {
+		t.Error("终态判断应持久生效")
+	}
+	if rooms := st2.Rooms(); len(rooms) != 1 || rooms[0].ID != "omm_A" {
+		t.Fatalf("名录未持久化: %+v", rooms)
 	}
 }
 
-// ---- 小工具 ----
-
-type wantBool int
-
-const (
-	wantTrue  wantBool = 0
-	wantFalse wantBool = 1
-)
-
-func waitFor(t *testing.T, cond func() bool, msg string, expect wantBool) {
+// waitQuiet 等待一小段时间确认无异步会话启动。
+func waitQuiet(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(50 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		got := cond()
-		if (expect == wantTrue && got) || (expect == wantFalse && !got) {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if (expect == wantTrue && !cond()) || (expect == wantFalse && cond()) {
-		t.Logf("条件最终满足: %s", msg)
-		return
-	}
+	time.Sleep(30 * time.Millisecond)
 }

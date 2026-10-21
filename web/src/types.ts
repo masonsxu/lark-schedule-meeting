@@ -14,6 +14,10 @@ export interface Rule {
   startTime: string
   endTime: string
   triggerTime: string
+  /** 提前多少天的“抢座日”开始抢目标日期；缺省 30（公司最早可提前 30 天预约） */
+  leadDays?: number
+  /** 目标日期落在周六/周日时跳过；缺省 true */
+  skipWeekends?: boolean
   enabled: boolean
   allowNoRoom?: boolean
   windowMinutes?: number
@@ -71,6 +75,8 @@ export interface Room {
   id: string
   name: string
   capacity?: number
+  source?: string
+  updatedAt?: string
 }
 
 export interface AppConfig {
