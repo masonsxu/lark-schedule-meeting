@@ -53,7 +53,7 @@ export function leadDaysOf(rule: Rule): number {
   return rule.leadDays && rule.leadDays > 0 ? rule.leadDays : 30
 }
 
-/** nextGrab 计算下一次抢座计划：返回抢座日与目标会议日期。 */
+/** nextGrab 计算下一次预约计划：返回预约发起日与目标会议日期。 */
 export function nextGrab(
   rule: Rule,
   from: Date = new Date(),

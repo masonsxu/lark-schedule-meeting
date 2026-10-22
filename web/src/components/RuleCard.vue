@@ -80,11 +80,11 @@ async function remove() {
         <dd>{{ cycleLabel(rule.cycle) }}<span class="meta-sub">，首次 {{ rule.startDate }}</span></dd>
       </div>
       <div class="meta-row">
-        <dt>抢座开始</dt>
+        <dt>预约开始</dt>
         <dd class="mono">{{ rule.triggerTime }}（提前 {{ rule.leadDays && rule.leadDays > 0 ? rule.leadDays : 30 }} 天）</dd>
       </div>
       <div v-if="plan" class="meta-row">
-        <dt>下次抢座</dt>
+        <dt>下次预约</dt>
         <dd class="mono">{{ plan.grabDate }} {{ rule.triggerTime }} → 目标 {{ plan.targetDate }}</dd>
       </div>
       <div class="meta-row">
@@ -113,12 +113,12 @@ async function remove() {
         type="button"
         :disabled="busy"
         @click="runNow"
-        :title="`立即抢目标日期 ${plan?.targetDate ?? ''}`"
+        :title="`立即预约目标日期 ${plan?.targetDate ?? ''}`"
       >
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
         </svg>
-        立即抢
+        立即预约
       </button>
       <button class="btn btn-sm" type="button" :disabled="busy" @click="emit('edit', rule)">编辑</button>
       <button class="btn btn-sm btn-ghost" type="button" :disabled="busy" @click="remove">删除</button>

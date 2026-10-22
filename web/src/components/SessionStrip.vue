@@ -9,7 +9,7 @@ const finished = computed(() => props.sessions.filter((s) => s.status !== 'runni
 
 const statusName: Record<string, string> = {
   booked: '已约到',
-  occupied: '无房可抢',
+  occupied: '无房可约',
   failed: '失败',
 }
 
@@ -31,7 +31,7 @@ function fmtTime(iso: string): string {
   <div v-if="running.length > 0 || finished.length > 0" class="strip panel" aria-live="polite">
     <div v-for="s in running" :key="s.ruleId + s.date" class="strip-item running">
       <div class="strip-main">
-        <span class="badge badge-running">抢座中</span>
+        <span class="badge badge-running">预约中</span>
         <span class="strip-title">{{ s.ruleName }}</span>
         <span class="mono strip-date">{{ s.date }}</span>
       </div>

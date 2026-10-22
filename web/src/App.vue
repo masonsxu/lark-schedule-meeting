@@ -84,8 +84,8 @@ function onEditorSaved() {
   <div class="container">
     <header class="app-header">
       <div class="brand">
-        <h1>会议室抢座台</h1>
-        <p class="tagline">飞书会议室抢座：循环规则 + 提前 30 天定时，10 分钟窗口每分钟一次</p>
+        <h1>会议室预约台</h1>
+        <p class="tagline">飞书会议室预约：循环规则 + 提前 30 天定时，10 分钟窗口每分钟一次</p>
       </div>
       <div class="header-status">
         <span v-if="health?.lark.ok" class="badge badge-booked" title="lark-cli 授权正常">
@@ -94,7 +94,7 @@ function onEditorSaved() {
         <span v-else class="badge badge-failed" :title="health?.lark.error ?? '无法连接 lark-cli'">
           lark-cli 异常
         </span>
-        <span v-if="runningCount > 0" class="badge badge-running">抢座进行中 {{ runningCount }}</span>
+        <span v-if="runningCount > 0" class="badge badge-running">预约进行中 {{ runningCount }}</span>
         <button class="btn btn-primary" type="button" @click="openCreate">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" />

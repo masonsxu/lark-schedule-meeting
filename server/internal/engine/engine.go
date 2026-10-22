@@ -1,6 +1,6 @@
-// Package engine 实现周期扫描与抢座会话：
-// 目标日期 = 抢座日 + LeadDays（默认 30，公司规则最早可提前 30 天预约）；
-// 抢座日当天到达 TriggerTime 后开抢，窗口内每分钟一次，直接以固定会议室 ID 创建日程；
+// Package engine 实现周期扫描与预约会话：
+// 目标日期 = 预约发起日 + LeadDays（默认 30，公司规则最早可提前 30 天预约）；
+// 预约发起日当天到达 TriggerTime 后发起预约，窗口内每分钟一次，直接以固定会议室 ID 创建日程；
 // 终态记录写入存储，后续循环跳过已处理日期。
 package engine
 
@@ -26,7 +26,7 @@ const (
 	SessionFailed   = "failed"
 )
 
-// RunOptions 手动触发一次抢座时的参数覆盖。
+// RunOptions 手动触发一次预约时的参数覆盖。
 type RunOptions struct {
 	// Source 记录来源标记：auto | manual。
 	Source string
@@ -40,7 +40,7 @@ type RunOptions struct {
 	Date string
 }
 
-// Session 一次抢座会话的可观测状态。
+// Session 一次预约会话的可观测状态。
 type Session struct {
 	RuleID        string    `json:"ruleId"`
 	RuleName      string    `json:"ruleName"`
@@ -171,7 +171,7 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// Scan 执行一次扫描：今天是否为某规则目标日期的抢座日（目标日期 = 今天 + LeadDays），
+// Scan 执行一次扫描：今天是否为某规则目标日期的预约发起日（目标日期 = 今天 + LeadDays），
 // 是且该日期为有效循环目标、到达 TriggerTime、无终态记录、无运行会话时启动会话。
 func (e *Engine) Scan() {
 	loc := e.location()
@@ -203,7 +203,7 @@ func (e *Engine) Scan() {
 			continue
 		}
 		if err := e.Start(rule.ID, RunOptions{Source: "auto"}); err != nil {
-			e.log.Warn("启动抢座会话失败", "rule", rule.ID, "date", date, "err", err)
+			e.log.Warn("启动预约会话失败", "rule", rule.ID, "date", date, "err", err)
 		}
 	}
 }
@@ -227,7 +227,7 @@ func (e *Engine) intervalOf(rule *model.Rule, opts RunOptions) int {
 	return e.store.Config().GrabIntervalSeconds
 }
 
-// Start 为规则启动一次抢座会话。date 参数为目标会议日期；opts.Date 为空时按今天 + LeadDays 推算。
+// Start 为规则启动一次预约会话。date 参数为目标会议日期；opts.Date 为空时按今天 + LeadDays 推算。
 func (e *Engine) Start(ruleID string, opts RunOptions) error {
 	rule, ok := e.store.Rule(ruleID)
 	if !ok {
@@ -236,11 +236,11 @@ func (e *Engine) Start(ruleID string, opts RunOptions) error {
 	loc := e.location()
 	date := opts.Date
 	if date == "" {
-		// 默认抢下一个可抢的目标日期（抢座日不早于今天）。
+		// 默认预约下一个可预约的目标日期（预约发起日不早于今天）。
 		from := e.now().In(loc).AddDate(0, 0, rule.LeadDaysOr())
 		target, ok := rule.NextOccurrence(from, 400)
 		if !ok {
-			return fmt.Errorf("规则 %s 在未来 %d 天内没有可抢的目标日期", rule.Name, 400)
+			return fmt.Errorf("规则 %s 在未来 %d 天内没有可预约的目标日期", rule.Name, 400)
 		}
 		date = target.Format("2006-01-02")
 	}
@@ -393,7 +393,7 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 	e.store.AppendAttempt(model.Attempt{
 		RuleID: rule.ID, RuleName: rule.Name, Date: date,
 		Kind: "session-start", OK: true,
-		Detail: fmt.Sprintf("窗口 %s，最多尝试 %d 次，间隔 %ds，提前 %d 天抢目标日期",
+		Detail: fmt.Sprintf("窗口 %s，最多尝试 %d 次，间隔 %ds，提前 %d 天预约目标日期",
 			e.windowOf(&rule), s.MaxAttempts, intervalSec, rule.LeadDaysOr()),
 	})
 
@@ -434,7 +434,7 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 		}
 	}
 	if len(withID) == 0 {
-		note := "规则缺少带 ID 的会议室，无法抢座"
+		note := "规则缺少带 ID 的会议室，无法预约"
 		if rule.AllowNoRoom {
 			note = "规则无带 ID 会议室，按 allowNoRoom 直接创建无房会议"
 		} else {
@@ -566,13 +566,13 @@ func (e *Engine) runSession(ctx context.Context, s *Session, rule model.Rule, da
 
 	if !booked {
 		status := model.StatusOccupied
-		note := "抢座窗口结束，目标会议室均未成功"
+		note := "预约窗口结束，目标会议室均未成功"
 		if lastErr != "" {
 			note += "：" + lastErr
 		}
 		if !createAttempted {
 			status = model.StatusFailed
-			note = "抢座窗口结束，未能发起任何预约请求"
+			note = "预约窗口结束，未能发起任何预约请求"
 		}
 		_ = e.store.UpsertRecord(model.Record{
 			RuleID: rule.ID, RuleName: rule.Name, Date: date,

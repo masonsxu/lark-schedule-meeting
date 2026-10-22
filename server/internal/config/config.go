@@ -17,7 +17,7 @@ type Config struct {
 	Timezone string `json:"timezone"`
 	// TickSeconds 调度器扫描间隔。
 	TickSeconds int `json:"tickSeconds"`
-	// GrabWindowMinutes 每次抢座窗口总时长（分钟）。
+	// GrabWindowMinutes 每次预约窗口总时长（分钟）。
 	GrabWindowMinutes int `json:"grabWindowMinutes"`
 	// GrabIntervalSeconds 窗口内两次尝试的间隔（秒）。
 	GrabIntervalSeconds int `json:"grabIntervalSeconds"`

@@ -12,7 +12,7 @@ const error = ref('')
 
 const statusMeta: Record<string, { label: string; cls: string }> = {
   booked: { label: '已预约', cls: 'badge-booked' },
-  occupied: { label: '无房可抢', cls: 'badge-occupied' },
+  occupied: { label: '无房可约', cls: 'badge-occupied' },
   failed: { label: '失败', cls: 'badge-failed' },
 }
 
@@ -28,7 +28,7 @@ function fmtTime(iso: string): string {
 
 async function remove(rec: BookingRecord, deleteEvent: boolean) {
   const scope = deleteEvent && rec.eventId ? '记录与飞书日程' : '记录（保留飞书日程）'
-  if (!window.confirm(`删除${scope}？日期 ${rec.date} 将重新允许抢座。`)) return
+  if (!window.confirm(`删除${scope}？日期 ${rec.date} 将重新允许预约。`)) return
   busyId.value = rec.id
   error.value = ''
   try {

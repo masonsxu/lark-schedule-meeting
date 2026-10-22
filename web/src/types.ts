@@ -18,7 +18,7 @@ export interface Rule {
   startTime: string
   endTime: string
   triggerTime: string
-  /** 提前多少天的“抢座日”开始抢目标日期；缺省 30（公司最早可提前 30 天预约） */
+  /** 提前多少天的“预约发起日”开始预约目标日期；缺省 30（公司最早可提前 30 天预约） */
   leadDays?: number
   /** 目标日期落在周六/周日时跳过；缺省 true */
   skipWeekends?: boolean
@@ -95,7 +95,7 @@ export interface AppConfig {
 }
 
 export const CYCLE_OPTIONS = [
-  { value: 'once', label: '不循环（只抢一次）' },
+  { value: 'once', label: '不循环（只预约一次）' },
   { value: 'daily', label: '每天' },
   { value: 'weekly', label: '每周' },
   { value: 'monthly', label: '每月' },

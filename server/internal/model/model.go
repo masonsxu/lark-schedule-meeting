@@ -25,7 +25,7 @@ func (r RoomRef) DisplayName() string {
 
 // 循环规则类型（一次只能选择一种；空值视为 CycleOnce）。
 const (
-	// CycleOnce 不循环：只抢首个目标日期一次，抢完（无论成败）规则自动关闭。
+	// CycleOnce 不循环：只预约首个目标日期一次，预约完成（无论成败）规则自动关闭。
 	CycleOnce = "once"
 	// CycleDaily 按天循环。
 	CycleDaily = "daily"
@@ -39,7 +39,7 @@ const (
 
 // CycleNames 循环类型的展示名。
 var CycleNames = map[string]string{
-	CycleOnce: "不循环（只抢一次）", CycleDaily: "每天", CycleWeekly: "每周",
+	CycleOnce: "不循环（只预约一次）", CycleDaily: "每天", CycleWeekly: "每周",
 	CycleMonthly: "每月", CycleQuarterly: "每季度",
 }
 
@@ -56,16 +56,16 @@ type Rule struct {
 	Rooms       []RoomRef `json:"rooms"`
 	StartTime   string    `json:"startTime"`   // 会议开始 HH:MM（目标日期当天）
 	EndTime     string    `json:"endTime"`     // 会议结束 HH:MM
-	TriggerTime string    `json:"triggerTime"` // 抢座开始时刻 HH:MM（在抢座日 = 目标日期 - LeadDays 当天生效）
-	// LeadDays 提前多少天的"抢座日"开始抢目标日期；<=0 视为默认 30
-	// （公司规则：会议室最早可提前 30 天预约，窗口开放即抢）。
+	TriggerTime string    `json:"triggerTime"` // 预约开始时刻 HH:MM（在预约发起日 = 目标日期 - LeadDays 当天生效）
+	// LeadDays 提前多少天的"预约发起日"开始预约目标日期；<=0 视为默认 30
+	// （公司规则：会议室最早可提前 30 天预约，窗口开放即发起预约）。
 	LeadDays int `json:"leadDays,omitempty"`
-	// SkipWeekends 目标日期落在周六/周日时不抢；nil 视为 true（默认跳过周六日）。
+	// SkipWeekends 目标日期落在周六/周日时不预约；nil 视为 true（默认跳过周六日）。
 	SkipWeekends *bool `json:"skipWeekends,omitempty"`
 	Enabled      bool  `json:"enabled"`
 	// AllowNoRoom 为 true 时，目标会议室全部预约失败也照常创建日程（不带会议室）。
 	AllowNoRoom bool `json:"allowNoRoom,omitempty"`
-	// WindowMinutes 覆盖全局抢座窗口（分钟）；0 表示使用全局配置。
+	// WindowMinutes 覆盖全局预约窗口（分钟）；0 表示使用全局配置。
 	WindowMinutes int `json:"windowMinutes,omitempty"`
 	// IntervalSeconds 覆盖全局尝试间隔（秒）；0 表示使用全局配置。
 	IntervalSeconds int       `json:"intervalSeconds,omitempty"`
@@ -97,11 +97,11 @@ func (r *Rule) SkipWeekendsOn() bool {
 	return *r.SkipWeekends
 }
 
-// 预约记录状态。三种状态均为终态：同一目标日期同一规则不再重复发起抢座。
+// 预约记录状态。三种状态均为终态：同一目标日期同一规则不再重复发起预约。
 const (
 	// StatusBooked 预约成功（含检测到本规则日程已存在）。
 	StatusBooked = "booked"
-	// StatusOccupied 抢座窗口结束仍无成功（目标会议室均被占用或预约失败）。
+	// StatusOccupied 预约窗口结束仍无成功（目标会议室均被占用或预约失败）。
 	StatusOccupied = "occupied"
 	// StatusFailed 配置缺失或接口持续异常。
 	StatusFailed = "failed"
@@ -203,13 +203,13 @@ func (r *Rule) Validate() error {
 		return errors.New("会议结束时间必须晚于开始时间")
 	}
 	if _, _, err := ParseHM(r.TriggerTime); err != nil {
-		return fmt.Errorf("抢座开始时刻：%w", err)
+		return fmt.Errorf("预约开始时刻：%w", err)
 	}
 	if r.LeadDays < 0 || r.LeadDays > 365 {
 		return errors.New("提前天数应在 0-365 之间")
 	}
 	if r.WindowMinutes < 0 || r.WindowMinutes > 24*60 {
-		return errors.New("抢座窗口分钟数超出范围")
+		return errors.New("预约窗口分钟数超出范围")
 	}
 	if r.IntervalSeconds < 0 {
 		return errors.New("尝试间隔不能为负")
@@ -303,7 +303,7 @@ func (r *Rule) SlotFor(date string, loc *time.Location) (time.Time, time.Time, e
 	return start, end, nil
 }
 
-// TriggerAt 计算抢座日（目标日期 - LeadDays）当天的抢座开始时刻。
+// TriggerAt 计算预约发起日（目标日期 - LeadDays）当天的预约开始时刻。
 func (r *Rule) TriggerAt(grabDay string, loc *time.Location) (time.Time, error) {
 	day, err := time.ParseInLocation("2006-01-02", grabDay, loc)
 	if err != nil {

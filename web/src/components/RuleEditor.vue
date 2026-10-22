@@ -181,7 +181,7 @@ async function save() {
               <input id="rule-end" v-model="draft.endTime" type="time" required />
             </div>
             <div class="field">
-              <label for="rule-trigger">抢座开始时刻</label>
+              <label for="rule-trigger">预约开始时刻</label>
               <input id="rule-trigger" v-model="draft.triggerTime" type="time" required />
             </div>
             <div class="field">
@@ -195,8 +195,8 @@ async function save() {
           </div>
           <p class="hint">
             目标日期从首次目标日期起按循环规则依次推进（每天 / 每周同星期 / 每月同日 / 每季度同日）；
-            抢座日 = 目标日期 - 提前天数（默认 30：公司会议室最早可提前 30 天预约），到达"抢座开始时刻"后开抢：
-            10 分钟窗口内每分钟一次，按优先级以固定会议室 ID 直传预约。不循环 = 只抢一次，抢完自动关闭规则。
+            预约发起日 = 目标日期 - 提前天数（默认 30：公司会议室最早可提前 30 天预约），到达"预约开始时刻"后发起预约：
+            10 分钟窗口内每分钟一次，按优先级以固定会议室 ID 直传预约。不循环 = 只预约一次，预约完成自动关闭规则。
           </p>
         </fieldset>
 

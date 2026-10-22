@@ -172,20 +172,20 @@ func baseRule(firstTarget time.Time) model.Rule {
 	}
 }
 
-// grabDayFor 返回“目标日期 - 30 天”的抢座日。
+// grabDayFor 返回“目标日期 - 30 天”的预约发起日。
 func grabDayFor(target time.Time) time.Time {
 	return target.AddDate(0, 0, -30)
 }
 
 // ---- 场景测试 ----
 
-// 场景 1：抢座日到点触发，按优先级以固定 ID 直传创建；
-// A 被占则落到 B；目标日期 = 抢座日 + 30；终态记录后重复扫描不再触发。
+// 场景 1：预约发起日到点触发，按优先级以固定 ID 直传创建；
+// A 被占则落到 B；目标日期 = 预约发起日 + 30；终态记录后重复扫描不再触发。
 func TestScanBooksByFixedRoomID(t *testing.T) {
 	loc := mustLoc(t)
 	target := nextWeekdayFrom(time.Date(2026, 10, 20, 0, 0, 0, 0, loc), time.Monday)
 	grabDay := grabDayFor(target)
-	env := newEnv(t, grabDay.Add(9*time.Hour+5*time.Minute)) // 09:05 处于抢座窗口
+	env := newEnv(t, grabDay.Add(9*time.Hour+5*time.Minute)) // 09:05 处于预约窗口
 	rule := baseRule(target)
 	if err := env.store.UpsertRule(rule); err != nil {
 		t.Fatal(err)
@@ -200,7 +200,7 @@ func TestScanBooksByFixedRoomID(t *testing.T) {
 
 	finds, creates := env.fake.stats()
 	if finds != 0 {
-		t.Errorf("抢座路径不应调用 room-find，调用了 %d 次", finds)
+		t.Errorf("预约路径不应调用 room-find，调用了 %d 次", finds)
 	}
 	if len(creates) != 2 {
 		t.Fatalf("应先试 A（失败）再试 B（成功），共 2 次创建，得到 %d", len(creates))
@@ -217,7 +217,7 @@ func TestScanBooksByFixedRoomID(t *testing.T) {
 	}
 	// 每周规则不应被自动关闭。
 	if latest, _ := env.store.Rule(rule.ID); !latest.Enabled {
-		t.Error("每周规则抢座成功后不应自动关闭")
+		t.Error("每周规则预约成功后不应自动关闭")
 	}
 
 	// 再次扫描：已有终态记录，不得重复预约。
@@ -367,7 +367,7 @@ func TestMonthlyCycleOccurrences(t *testing.T) {
 	if err := env.store.UpsertRule(rule); err != nil {
 		t.Fatal(err)
 	}
-	// 非目标日（起始日 + 7 天对应的抢座日）不触发。
+	// 非目标日（起始日 + 7 天对应的预约发起日）不触发。
 	env.setNow(grabDayFor(start.AddDate(0, 0, 7)).Add(9*time.Hour + 5*time.Minute))
 	env.engine.Scan()
 	waitQuiet(t)
@@ -432,7 +432,7 @@ func TestDuplicateDetectionSkips(t *testing.T) {
 	}
 }
 
-// 场景 8：手动触发未指定日期时，取下一个可抢的目标日期（抢座日不早于今天）。
+// 场景 8：手动触发未指定日期时，取下一个可预约的目标日期（预约发起日不早于今天）。
 func TestManualRunDefaultDate(t *testing.T) {
 	loc := mustLoc(t)
 	now := time.Date(2026, 10, 21, 21, 0, 0, 0, loc) // 周三
